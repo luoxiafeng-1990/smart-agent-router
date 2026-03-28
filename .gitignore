@@ -1,1 +1,5 @@
 cloudflared
+.env
+opus_test*.json
+*.log
+__pycache__/

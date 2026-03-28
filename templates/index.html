@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Agent Router | Dashboard</title>
+    <!-- CSS -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-base: #0a0a0c;
+            --bg-panel: rgba(22, 24, 29, 0.6);
+            --bg-panel-hover: rgba(30, 33, 39, 0.8);
+            --border: rgba(255, 255, 255, 0.08);
+            --text-main: #e2e8f0;
+            --text-muted: #94a3b8;
+            --accent: #58a6ff;
+            --accent-glow: rgba(88, 166, 255, 0.3);
+            --success: #3fb950;
+            --success-bg: rgba(63, 185, 80, 0.1);
+            --warning: #ea5a00;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-base);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            background-image: 
+                radial-gradient(circle at 15% 50%, rgba(88, 166, 255, 0.08) 0%, transparent 40%),
+                radial-gradient(circle at 85% 30%, rgba(188, 140, 255, 0.08) 0%, transparent 40%);
+            overflow-x: hidden;
+        }
+
+        header {
+            padding: 2rem;
+            text-align: center;
+            border-bottom: 1px solid var(--border);
+            background: rgba(10, 10, 12, 0.8);
+            backdrop-filter: blur(12px);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            background: linear-gradient(90deg, #58a6ff, #bc8cff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+
+        .subtitle {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+        }
+
+        main {
+            flex: 1;
+            padding: 2.5rem 2rem;
+            max-width: 1000px;
+            margin: 0 auto;
+            width: 100%;
+            display: grid;
+            gap: 2rem;
+        }
+
+        /* Glass Panel */
+        .panel {
+            background: var(--bg-panel);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 2rem;
+            backdrop-filter: blur(16px);
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .panel::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0; height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+        }
+
+        .panel-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        /* Forms */
+        .form-group {
+            margin-bottom: 1.2rem;
+        }
+
+        label {
+            display: block;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+        }
+
+        input {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid var(--border);
+            color: var(--text-main);
+            padding: 0.8rem 1rem;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 0.95rem;
+            transition: all 0.2s ease;
+            outline: none;
+        }
+
+        input:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 1rem;
+        }
+
+        .btn {
+            background: linear-gradient(180deg, rgba(88, 166, 255, 0.1) 0%, rgba(88, 166, 255, 0) 100%);
+            border: 1px solid var(--accent);
+            color: var(--accent);
+            padding: 0.8rem 1.5rem;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            text-shadow: 0 0 10px rgba(88, 166, 255, 0.4);
+        }
+
+        .btn:hover {
+            background: var(--accent);
+            color: #000;
+            box-shadow: 0 0 15px var(--accent-glow);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        /* Model Grid */
+        .model-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 1rem;
+        }
+
+        .model-card {
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 1.25rem;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            cursor: pointer;
+            position: relative;
+        }
+
+        .model-card:hover {
+            border-color: var(--accent);
+            background: var(--bg-panel-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
+        }
+
+        .model-card.local:hover { border-color: var(--success); }
+
+        .model-title {
+            font-weight: 600;
+            font-size: 1.05rem;
+            margin-bottom: 0.5rem;
+            word-break: break-all;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .badge.local {
+            background: var(--success-bg);
+            color: var(--success);
+            border: 1px solid rgba(63, 185, 80, 0.3);
+        }
+
+        .badge.proxy {
+            background: rgba(188, 140, 255, 0.1);
+            color: #bc8cff;
+            border: 1px solid rgba(188, 140, 255, 0.3);
+        }
+        
+        .badge.probed {
+            background: rgba(234, 90, 0, 0.1);
+            color: #ff7b2a;
+            border: 1px solid rgba(234, 90, 0, 0.3);
+        }
+
+        /* Toast / Copy Notification */
+        .toast {
+            position: fixed;
+            bottom: 2rem;
+            left: 50%;
+            transform: translateX(-50%) translateY(100px);
+            background: var(--success);
+            color: #000;
+            padding: 0.75rem 1.5rem;
+            border-radius: 30px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            opacity: 0;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            z-index: 1000;
+            box-shadow: 0 4px 15px rgba(63, 185, 80, 0.4);
+        }
+
+        .toast.show {
+            transform: translateX(-50%) translateY(0);
+            opacity: 1;
+        }
+
+        /* Loader */
+        .loader {
+            width: 16px;
+            height: 16px;
+            border: 2px solid transparent;
+            border-top-color: currentColor;
+            border-right-color: currentColor;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            display: none;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .loading .loader { display: inline-block; }
+        
+        #testing-logs {
+            font-family: monospace;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-top: 1rem;
+            padding: 1rem;
+            background: rgba(0,0,0,0.5);
+            border-radius: 8px;
+            display: none;
+            white-space: pre-wrap;
+            border: 1px solid var(--border);
+        }
+
+        .empty-state {
+            grid-column: 1 / -1;
+            text-align: center;
+            padding: 3rem;
+            color: var(--text-muted);
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>🧠 Smart Agent Router</h1>
+    <div class="subtitle" id="status-indicator">正在连接至本地代理内核...</div>
+</header>
+
+<main>
+    <!-- Section 1: Dashboard Configuration -->
+    <section class="panel">
+        <h2 class="panel-title">☁️ 添加外部超脑 (第三方 API 配置)</h2>
+        <p class="subtitle" style="margin-bottom: 1.5rem;">配置市面上更低廉的渠道商，让游离大模型替你编程。该配置将动态覆盖 <code>.env</code> 文件且热重载生效。</p>
+        
+        <div class="form-row">
+            <div class="form-group">
+                <label for="base-url">代理 Base URL (例: https://apiclaw.ai)</label>
+                <input type="text" id="base-url" placeholder="https://api.example.com" autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label for="api-key">API Key (凭证)</label>
+                <input type="password" id="api-key" placeholder="sk-..." autocomplete="off">
+            </div>
+        </div>
+        
+        <div style="display: flex; gap: 1rem; margin-top: 0.5rem;">
+            <button class="btn" id="btn-detect" onclick="detectModels()">
+                <span class="loader"></span>
+                <span>智能扫描与探针验活</span>
+            </button>
+            <button class="btn" style="border-color: var(--success); color: var(--success);" id="btn-save" onclick="saveConfig()">
+                <span class="loader"></span>
+                <span>保存配置并热加载</span>
+            </button>
+        </div>
+
+        <div id="testing-logs"></div>
+    </section>
+
+    <!-- Section 2: Model Gallery -->
+    <section class="panel">
+        <h2 class="panel-title" style="margin-bottom: 0.5rem;">🎨 可用模型画廊 (Model Gallery)</h2>
+        <p class="subtitle" style="margin-bottom: 1.5rem;">点击任一卡片即可复制模型 ID，由于代理进行了降噪与转译，这些模型均已获得 Tool Calling 的直接支持！</p>
+        
+        <h3 style="font-size: 0.9rem; color: var(--success); margin-bottom: 1rem; text-transform: uppercase; letter-spacing: 0.1em;">🟢 Antigravity 本地全免费</h3>
+        <div class="model-grid" id="local-models">
+            <!-- Rendered via JS -->
+        </div>
+
+        <h3 style="font-size: 0.9rem; color: #bc8cff; margin-top: 2.5rem; margin-bottom: 1rem; text-transform: uppercase; letter-spacing: 0.1em;">☁️ 外部代理模型池</h3>
+        <div class="model-grid" id="remote-models">
+            <div class="empty-state">尚未配置第三方代理或查询不到模型，你可以先在上方侦测扫描配置。</div>
+        </div>
+    </section>
+</main>
+
+<div class="toast" id="toast">✅ 已复制模型 ID，请前往 Cursor 粘贴！</div>
+
+<script>
+    const G_STATE = { local: [], remote: [], probed: [] };
+
+    window.onload = async () => {
+        await checkStatus();
+    };
+
+    function copyToClipboard(text) {
+        navigator.clipboard.writeText(text).then(() => {
+            const toast = document.getElementById('toast');
+            toast.className = 'toast show';
+            setTimeout(() => { toast.className = 'toast'; }, 2500);
+        });
+    }
+
+    function renderModels() {
+        const localContainer = document.getElementById('local-models');
+        const remoteContainer = document.getElementById('remote-models');
+
+        // Local
+        if (G_STATE.local.length > 0) {
+            localContainer.innerHTML = G_STATE.local.map(m => `
+                <div class="model-card local" onclick="copyToClipboard('${m}')">
+                    <div class="model-title">${m}</div>
+                    <span class="badge local">Antigravity Local</span>
+                </div>
+            `).join('');
+        } else {
+            localContainer.innerHTML = `<div class="empty-state">本地 Antigravity 未发现模型，请检查语言服务器是否正常启动。</div>`;
+        }
+
+        // Remote
+        if (G_STATE.remote.length > 0) {
+            remoteContainer.innerHTML = G_STATE.remote.map(m => {
+                const isTested = G_STATE.probed.includes(m);
+                const badge = isTested ? `<span class="badge probed">🔥 Probed Verified</span>` : `<span class="badge proxy">Third Party</span>`;
+                return `
+                <div class="model-card" onclick="copyToClipboard('${m}')">
+                    <div class="model-title">${m}</div>
+                    ${badge}
+                </div>
+            `}).join('');
+        } else {
+            remoteContainer.innerHTML = `<div class="empty-state">尚未配置第三方代理或查询不到模型，你可以先在上方侦测扫描配置。</div>`;
+        }
+    }
+
+    async function checkStatus() {
+        try {
+            const resp = await fetch("/api/status");
+            if (resp.ok) {
+                const data = await resp.json();
+                document.getElementById('status-indicator').innerText = `🔗 已连接网关 (LS Port: ${data.ls_port || '未连接'})`;
+                
+                G_STATE.local = data.local_models || [];
+                
+                if (data.third_party.base_url) {
+                    document.getElementById('base-url').value = data.third_party.base_url;
+                }
+                
+                // Fetch external models dynamically from proxy if /v1/models is alive
+                try {
+                    const extResp = await fetch("/v1/models");
+                    if (extResp.ok) {
+                        const modelsData = await extResp.json();
+                        const ext = modelsData.data
+                            .filter(m => m.owned_by !== "antigravity" && m.owned_by !== "antigravity (local)")
+                            .map(m => m.id);
+                        G_STATE.remote = ext;
+                    }
+                } catch(e) { console.error("Could not fetch mixed models", e) }
+
+                renderModels();
+            }
+        } catch (e) {
+            document.getElementById('status-indicator').innerText = `❌ 本地直连网关异常，请确保 server.py 运行中`;
+            document.getElementById('status-indicator').style.color = 'var(--warning)';
+        }
+    }
+
+    function logToUI(msg) {
+        const logger = document.getElementById('testing-logs');
+        logger.style.display = 'block';
+        logger.innerText += msg + "\n";
+    }
+
+    async function detectModels() {
+        const baseUrl = document.getElementById('base-url').value.trim();
+        const apiKey = document.getElementById('api-key').value.trim();
+        
+        if (!baseUrl || !apiKey) {
+            alert("请填入完整的 Base URL 和 API Key！\n如果你使用的是便宜代理比如 apiclaw.ai，请一并填入。");
+            return;
+        }
+
+        const btn = document.getElementById('btn-detect');
+        btn.classList.add('loading');
+        btn.disabled = true;
+        
+        const logger = document.getElementById('testing-logs');
+        logger.style.display = 'block';
+        logger.innerText = "🚀 开始扮演光速探针...\n-> [" + baseUrl + "] requesting /v1/models\n";
+
+        try {
+            const resp = await fetch("/api/models/discover", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ base_url: baseUrl, api_key: apiKey })
+            });
+
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || "未知网络错误");
+
+            logToUI(`✓ 成功捕获对方全量模型：共 ${data.models.length} 个`);
+            if (data.probed_success && data.probed_success.length > 0) {
+                logToUI(`🔥 并发连通性探针测试成功！代表性模型 (如 Claude/GPT): [${data.probed_success.join(", ")}] 真实心跳存活！`);
+            }
+
+            G_STATE.remote = data.models;
+            G_STATE.probed = data.probed_success || [];
+            renderModels();
+
+        } catch (err) {
+            logToUI(`❌ 探针失败: ${err.message}`);
+        } finally {
+            btn.classList.remove('loading');
+            btn.disabled = false;
+        }
+    }
+
+    async function saveConfig() {
+        const baseUrl = document.getElementById('base-url').value.trim();
+        const apiKey = document.getElementById('api-key').value.trim();
+        
+        const btn = document.getElementById('btn-save');
+        btn.classList.add('loading');
+        btn.disabled = true;
+
+        try {
+            const resp = await fetch("/api/config/update", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ base_url: baseUrl, api_key: apiKey })
+            });
+            const data = await resp.json();
+            if (resp.ok) {
+                alert(data.message);
+                await checkStatus(); // Reload
+            } else {
+                alert("保存失败：" + (data.error || "未知错误"));
+            }
+        } catch (e) {
+            alert("保存请求发送失败: " + e.message);
+        } finally {
+            btn.classList.remove('loading');
+            btn.disabled = false;
+        }
+    }
+</script>
+</body>
+</html>

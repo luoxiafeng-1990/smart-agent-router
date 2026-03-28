@@ -23,13 +23,14 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
+import dotenv
 load_dotenv()
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 
 # ─────────────────────────────── 代理跳过 ───────────────────────────────
 # 移除所有代理相关环境变量，防止 httpx 误将本地 127.0.0.1 流量发往梯子导致超时或重置
@@ -52,8 +53,30 @@ EXTERNAL_ANTHROPIC_API_KEY = os.environ.get("EXTERNAL_ANTHROPIC_API_KEY", "")
 
 def _use_external_proxy(model_id: str) -> bool:
     """判断当前请求是否需要转发至第三方（而不是走本地免费的 Antigravity）"""
-    # 策略：如果模型名字包含 claude 且提供了 API KEY，则转发给外部代理
-    return "claude" in model_id.lower() and bool(EXTERNAL_ANTHROPIC_API_KEY)
+    if not EXTERNAL_ANTHROPIC_API_KEY:
+        return False
+        
+    normalized = model_id.lower().strip()
+    
+    # 1. 带有 Antigravity 本源特征的，绝对走本地
+    if "4.6" in normalized or "antigravity" in normalized or "gemini" in normalized:
+        return False
+        
+    # 2. 外部主流商用标准的，绝对走外部
+    external_prefixes = ("claude-3", "gpt-", "o1-", "o3-", "deepseek-")
+    if any(normalized.startswith(p) for p in external_prefixes):
+        return True
+        
+    # 3. 检查是否精确存在于本地可用模型缓存中
+    try:
+        models = _fetch_models()
+        if normalized in models:
+            return False
+    except Exception:
+        pass
+        
+    # 兜底：如果用户只写了 claude，那就送给外面
+    return "claude" in normalized
 
 LOG_DIR.mkdir(exist_ok=True)
 logging.basicConfig(
@@ -249,19 +272,25 @@ def _resolve_model(model_id: str) -> str:
     if normalized in models:
         return models[normalized]["internal_key"]
 
-    # 模糊匹配
+    # 增强版模式匹配：只要求对方名字包含核心关键词即可
+    for mid, info in models.items():
+        if "gemini" in normalized and "gemini" in info["label"].lower():
+            return info["internal_key"]
+        if "claude" in normalized and "claude" in info["label"].lower():
+            return info["internal_key"]
+            
+    # 如果实在匹配不到对应的厂牌，尝试降级到最基本的模糊名称
     for mid, info in models.items():
         if normalized in mid or normalized in info["label"].lower():
             return info["internal_key"]
-        if model_id == info["internal_key"]:
-            return info["internal_key"]
-
+            
     # 默认第一个
     if models:
         first = next(iter(models.values()))
-        logger.warning(f"模型 '{model_id}' 未找到，使用默认: {first['label']}")
+        logger.warning(f"模型 '{model_id}' 均未能精确匹配，随机使用默认存活: {first['label']}")
         return first["internal_key"]
-    raise ValueError(f"无法解析模型 '{model_id}'，language server 可能未连接")
+        
+    raise ValueError(f"无法解析模型 '{model_id}'，Language Server 内部模型表均为空")
 
 
 # ───────────────────── Prompt 构建（核心改造） ──────────────────────
@@ -454,19 +483,86 @@ def _check_auth(request: Request) -> bool:
 @app.get("/")
 async def root():
     try:
+        with open("templates/index.html", "r", encoding="utf-8") as f:
+            html = f.read()
+        return HTMLResponse(content=html)
+    except Exception as e:
+        return JSONResponse({"status": "error", "detail": "Web Dashboard not found. Create templates/index.html first."}, status_code=500)
+
+@app.get("/api/status")
+async def get_status():
+    try:
         port, _ = _discover_ls()
         models = _fetch_models()
-        return {
-            "service": "Antigravity Proxy",
-            "version": "5.0.0",
-            "status": "ok",
-            "ls_port": port,
-            "models_count": len(models),
-            "models": list(models.keys()),
+    except Exception:
+        port, models = None, {}
+    return {
+        "service": "Smart Agent Router",
+        "ls_port": port,
+        "local_models_count": len(models),
+        "local_models": list(models.keys()),
+        "third_party": {
+            "enabled": bool(EXTERNAL_ANTHROPIC_API_KEY),
+            "base_url": EXTERNAL_ANTHROPIC_BASE_URL,
+            "api_key": "***" + EXTERNAL_ANTHROPIC_API_KEY[-4:] if EXTERNAL_ANTHROPIC_API_KEY else ""
         }
-    except Exception as e:
-        return JSONResponse({"service": "Antigravity Proxy", "status": "error", "detail": str(e)}, status_code=503)
+    }
 
+@app.post("/api/config/update")
+async def update_config(request: Request):
+    global EXTERNAL_ANTHROPIC_BASE_URL, EXTERNAL_ANTHROPIC_API_KEY
+    data = await request.json()
+    new_url = data.get("base_url", "").strip().rstrip("/")
+    new_key = data.get("api_key", "").strip()
+    
+    env_file = ".env"
+    if not os.path.exists(env_file):
+        with open(env_file, "w") as f: pass
+    
+    dotenv.set_key(env_file, "EXTERNAL_ANTHROPIC_BASE_URL", new_url)
+    dotenv.set_key(env_file, "EXTERNAL_ANTHROPIC_API_KEY", new_key)
+    
+    # Hot Reload
+    EXTERNAL_ANTHROPIC_BASE_URL = new_url
+    EXTERNAL_ANTHROPIC_API_KEY = new_key
+    
+    return {"status": "ok", "message": "代理配置已保存并热生效！"}
+
+@app.post("/api/models/discover")
+async def discover_models(request: Request):
+    data = await request.json()
+    base_url = data.get("base_url", "").strip().rstrip("/")
+    api_key = data.get("api_key", "").strip()
+    
+    if not base_url or not api_key:
+        return JSONResponse({"error": "缺少 Base URL 或 API Key"}, status_code=400)
+        
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{base_url}/v1/models", headers={"Authorization": f"Bearer {api_key}"})
+            if resp.status_code != 200:
+                err = resp.text[:100]
+                return JSONResponse({"error": f"目标端异常 {resp.status_code}: {err}"}, status_code=502)
+                
+            remote_models = [m.get("id") for m in resp.json().get("data", [])]
+            
+            # Smart Probing on top representative Agentic models
+            top_models = [m for m in remote_models if "sonnet" in m or "gpt-4o" in m]
+            top_models = top_models[:2] if top_models else remote_models[:2]
+            
+            working_models = []
+            for tm in top_models:
+                payload = {"model": tm, "messages": [{"role": "user", "content": "1"}], "max_tokens": 2}
+                try:
+                    probe = await client.post(f"{base_url}/v1/chat/completions", json=payload, headers={"Authorization": f"Bearer {api_key}"}, timeout=8)
+                    if probe.status_code == 200:
+                        working_models.append(tm)
+                except Exception:
+                    pass
+                    
+            return {"status": "ok", "models": remote_models, "probed_success": working_models}
+    except Exception as e:
+        return JSONResponse({"error": f"检测失败: {str(e)}"}, status_code=500)
 
 @app.get("/health")
 async def health():
@@ -485,12 +581,29 @@ async def list_models(request: Request):
         models = _fetch_models()
     except Exception as e:
         return JSONResponse({"error": {"message": str(e)}}, status_code=502)
+        
+    combined_data = [
+        {"id": mid, "object": "model", "created": 1700000000, "owned_by": "antigravity (local)"}
+        for mid in models
+    ]
+    
+    if EXTERNAL_ANTHROPIC_API_KEY and EXTERNAL_ANTHROPIC_BASE_URL:
+        try:
+            async with httpx.AsyncClient(timeout=4) as client:
+                r = await client.get(f"{EXTERNAL_ANTHROPIC_BASE_URL}/v1/models", headers={"Authorization": f"Bearer {EXTERNAL_ANTHROPIC_API_KEY}"})
+                if r.status_code == 200:
+                    ext_data = r.json().get("data", [])
+                    for m in ext_data:
+                        if not m.get("owned_by"): m["owned_by"] = "third-party proxy"
+                        # De-duplicate
+                        if not any(cd["id"] == m["id"] for cd in combined_data):
+                            combined_data.append(m)
+        except Exception as e:
+            logger.warning(f"获取第三方模型列表失败: {e}")
+
     return {
         "object": "list",
-        "data": [
-            {"id": mid, "object": "model", "created": 1700000000, "owned_by": "antigravity"}
-            for mid in models
-        ],
+        "data": combined_data
     }
 
 
@@ -539,6 +652,12 @@ async def chat_completions(request: Request):
         result = _call_ls("GetModelResponse", {"model": internal_key, "prompt": prompt})
     except RuntimeError as e:
         logger.error(f"[{req_id}] language server 错误: {e}")
+        err_msg = f"\n\n🚨 [Antigravity Proxy 网关截获报错]\n底层引擎拒绝服务: {e}\n\n💡 诊断：通常由于 Antigravity 该模型当前并发超载或账号额度被抽空。\n建议：请转到 Web 控制台添加 [第三方代理 API] 并改用外部商业模型！"
+        if stream:
+            return StreamingResponse(
+                _stream_response(f"err-{uuid.uuid4().hex[:8]}", int(time.time()), model_id, err_msg, []),
+                media_type="text/event-stream"
+            )
         return JSONResponse({"error": {"message": str(e)}}, status_code=502)
 
     raw_text = result.get("response", "")

@@ -1,0 +1,90 @@
+<svg width="800" height="300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0d1117" />
+      <stop offset="100%" stop-color="#161b22" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="5" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <style>
+    .node { fill: #1e1e1e; stroke: #36BCF5; stroke-width: 2; rx: 8; }
+    .text-title { fill: #ffffff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 16px; font-weight: bold; text-anchor: middle; }
+    .text-desc { fill: #8b949e; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; text-anchor: middle; }
+    
+    /* pnA¨; */
+    .flow-line { fill: none; stroke: #30363d; stroke-width: 4; }
+    .flow-anim { 
+      fill: none; 
+      stroke: #36BCF5; 
+      stroke-width: 4; 
+      stroke-dasharray: 15 15; 
+      animation: flow 1s linear infinite; 
+    }
+    .flow-anim-reverse { 
+      fill: none; 
+      stroke: #2ea043; 
+      stroke-width: 4; 
+      stroke-dasharray: 15 15; 
+      animation: flow-rev 1s linear infinite; 
+    }
+    
+    @keyframes flow { to { stroke-dashoffset: -30; } }
+    @keyframes flow-rev { to { stroke-dashoffset: 30; } }
+    
+    /* ‚¹n¨¨; */
+    .floating { animation: float 3s ease-in-out infinite; }
+    @keyframes float {
+      0% { transform: translateY(0px); }
+      50% { transform: translateY(-5px); }
+      100% { transform: translateY(0px); }
+    }
+  </style>
+
+  <!-- Ìo -->
+  <rect width="100%" height="100%" fill="url(#bg)" rx="10"/>
+
+  <!-- Þ¥¿ (•r) -->
+  <path d="M 170 150 L 320 150" class="flow-line" />
+  <path d="M 480 150 L 630 150" class="flow-line" />
+
+  <!-- ¨;pnA (Cursor -> Proxy -> Antigravity) -->
+  <path d="M 170 145 L 320 145" class="flow-anim" filter="url(#glow)" />
+  <path d="M 480 145 L 630 145" class="flow-anim" filter="url(#glow)" />
+
+  <!-- ¨;pnAÔÞ (Antigravity -> Proxy -> Cursor) -->
+  <path d="M 320 155 L 170 155" class="flow-anim-reverse" filter="url(#glow)" />
+  <path d="M 630 155 L 480 155" class="flow-anim-reverse" filter="url(#glow)" />
+
+  <!-- ‚¹ 1: Cursor -->
+  <g class="floating" style="animation-delay: 0s;">
+    <rect x="30" y="110" width="140" height="80" class="node" />
+    <text x="100" y="145" class="text-title">=» Cursor IDE</text>
+    <text x="100" y="165" class="text-desc">Ñ OpenAI ÷B</text>
+  </g>
+
+  <!-- ‚¹ 2: ã¡ -->
+  <g class="floating" style="animation-delay: 0.5s;">
+    <rect x="320" y="100" width="160" height="100" class="node" style="stroke: #a371f7;" />
+    <text x="400" y="135" class="text-title">=á 8ÃãB</text>
+    <text x="400" y="155" class="text-desc">Prompt èelb</text>
+    <text x="400" y="175" class="text-desc">ÕÇ SSRF P6</text>
+  </g>
+
+  <!-- ‚¹ 3: Antigravity -->
+  <g class="floating" style="animation-delay: 1s;">
+    <rect x="630" y="110" width="140" height="80" class="node" style="stroke: #2ea043;" />
+    <text x="700" y="145" class="text-title">=€ Antigravity</text>
+    <text x="700" y="165" class="text-desc">Language Server</text>
+  </g>
+
+  <!-- ô‡W -->
+  <text x="245" y="130" class="text-desc" style="fill: #36BCF5;">÷B &amp; åwšI</text>
+  <text x="245" y="175" class="text-desc" style="fill: #2ea043;">SSE AÍ”</text>
+
+  <text x="555" y="130" class="text-desc" style="fill: #36BCF5;">¯‡, Prompt</text>
+  <text x="555" y="175" class="text-desc" style="fill: #2ea043;">&lt;tool_call&gt; ~</text>
+</svg>
