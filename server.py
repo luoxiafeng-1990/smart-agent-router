@@ -51,9 +51,18 @@ today         = datetime.now().strftime("%Y-%m-%d")
 EXTERNAL_ANTHROPIC_BASE_URL = os.environ.get("EXTERNAL_ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
 EXTERNAL_ANTHROPIC_API_KEY = os.environ.get("EXTERNAL_ANTHROPIC_API_KEY", "")
 
+EXTERNAL_DEEPSEEK_BASE_URL = os.environ.get("EXTERNAL_DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+EXTERNAL_DEEPSEEK_API_KEY = os.environ.get("EXTERNAL_DEEPSEEK_API_KEY", "")
+
 def _use_external_proxy(model_id: str) -> bool:
     """判断当前请求是否需要转发至第三方（而不是走本地免费的 Antigravity）"""
-    if not EXTERNAL_ANTHROPIC_API_KEY:
+    normalized = model_id.lower().strip()
+    
+    is_deepseek = "deepseek" in normalized
+    if is_deepseek and EXTERNAL_DEEPSEEK_API_KEY:
+        return True
+        
+    if not is_deepseek and not EXTERNAL_ANTHROPIC_API_KEY:
         return False
         
     normalized = model_id.lower().strip()
@@ -505,26 +514,39 @@ async def get_status():
             "enabled": bool(EXTERNAL_ANTHROPIC_API_KEY),
             "base_url": EXTERNAL_ANTHROPIC_BASE_URL,
             "api_key": "***" + EXTERNAL_ANTHROPIC_API_KEY[-4:] if EXTERNAL_ANTHROPIC_API_KEY else ""
+        },
+        "deepseek": {
+            "enabled": bool(EXTERNAL_DEEPSEEK_API_KEY),
+            "base_url": EXTERNAL_DEEPSEEK_BASE_URL,
+            "api_key": "***" + EXTERNAL_DEEPSEEK_API_KEY[-4:] if EXTERNAL_DEEPSEEK_API_KEY else ""
         }
     }
 
 @app.post("/api/config/update")
 async def update_config(request: Request):
     global EXTERNAL_ANTHROPIC_BASE_URL, EXTERNAL_ANTHROPIC_API_KEY
+    global EXTERNAL_DEEPSEEK_BASE_URL, EXTERNAL_DEEPSEEK_API_KEY
     data = await request.json()
     new_url = data.get("base_url", "").strip().rstrip("/")
     new_key = data.get("api_key", "").strip()
+    ds_url = data.get("ds_base_url", "").strip().rstrip("/")
+    ds_key = data.get("ds_api_key", "").strip()
     
     env_file = ".env"
     if not os.path.exists(env_file):
         with open(env_file, "w") as f: pass
     
-    dotenv.set_key(env_file, "EXTERNAL_ANTHROPIC_BASE_URL", new_url)
-    dotenv.set_key(env_file, "EXTERNAL_ANTHROPIC_API_KEY", new_key)
-    
-    # Hot Reload
-    EXTERNAL_ANTHROPIC_BASE_URL = new_url
-    EXTERNAL_ANTHROPIC_API_KEY = new_key
+    if new_url or new_key:
+        if new_url: dotenv.set_key(env_file, "EXTERNAL_ANTHROPIC_BASE_URL", new_url)
+        if new_key: dotenv.set_key(env_file, "EXTERNAL_ANTHROPIC_API_KEY", new_key)
+        EXTERNAL_ANTHROPIC_BASE_URL = new_url or EXTERNAL_ANTHROPIC_BASE_URL
+        EXTERNAL_ANTHROPIC_API_KEY = new_key or EXTERNAL_ANTHROPIC_API_KEY
+        
+    if ds_url or ds_key:
+        if ds_url: dotenv.set_key(env_file, "EXTERNAL_DEEPSEEK_BASE_URL", ds_url)
+        if ds_key: dotenv.set_key(env_file, "EXTERNAL_DEEPSEEK_API_KEY", ds_key)
+        EXTERNAL_DEEPSEEK_BASE_URL = ds_url or EXTERNAL_DEEPSEEK_BASE_URL
+        EXTERNAL_DEEPSEEK_API_KEY = ds_key or EXTERNAL_DEEPSEEK_API_KEY
     
     return {"status": "ok", "message": "代理配置已保存并热生效！"}
 
@@ -768,9 +790,15 @@ async def _stream_response(
 
 async def _forward_openai_to_external_openai(req_id: str, body: dict, stream: bool):
     """直接转发 OpenAI 格式请求给第三方代理，带破损 Claude 内部 tool tag 拦截修复机制"""
-    url = f"{EXTERNAL_ANTHROPIC_BASE_URL}/v1/chat/completions"
+    model_id = body.get("model", "")
+    is_ds = "deepseek" in model_id.lower()
+    
+    base_url = EXTERNAL_DEEPSEEK_BASE_URL if is_ds else EXTERNAL_ANTHROPIC_BASE_URL
+    api_key = EXTERNAL_DEEPSEEK_API_KEY if is_ds else EXTERNAL_ANTHROPIC_API_KEY
+
+    url = f"{base_url}/v1/chat/completions"
     forward_headers = {
-        "Authorization": f"Bearer {EXTERNAL_ANTHROPIC_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
 
@@ -778,6 +806,17 @@ async def _forward_openai_to_external_openai(req_id: str, body: dict, stream: bo
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
+    # DeepSeek API 要求 content 严格为 string（不支持多模态数组块），而 Cursor 经常传入 [{"type":"text","text":"..."}]
+    if is_ds and "messages" in body:
+        for msg in body["messages"]:
+            content = msg.get("content")
+            if isinstance(content, list):
+                text_buffer = []
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        text_buffer.append(b.get("text", ""))
+                msg["content"] = "\n".join(text_buffer)
+                
     async def _stream_proxy():
         async with httpx.AsyncClient(timeout=120) as client:
             try:

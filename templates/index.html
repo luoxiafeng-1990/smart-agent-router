@@ -305,7 +305,7 @@
         
         <div class="form-row">
             <div class="form-group">
-                <label for="base-url">代理 Base URL (例: https://apiclaw.ai)</label>
+                <label for="base-url">Anthropic/通用代理 Base URL (如 apiclaw.ai)</label>
                 <input type="text" id="base-url" placeholder="https://api.example.com" autocomplete="off">
             </div>
             <div class="form-group">
@@ -314,7 +314,19 @@
             </div>
         </div>
         
-        <div style="display: flex; gap: 1rem; margin-top: 0.5rem;">
+        <h3 style="font-size: 0.9rem; color: #58a6ff; margin: 1rem 0; text-transform: uppercase;">🐋 DeepSeek 专属通道</h3>
+        <div class="form-row">
+            <div class="form-group">
+                <label for="ds-base-url">DeepSeek Base URL</label>
+                <input type="text" id="ds-base-url" placeholder="https://api.deepseek.com" value="https://api.deepseek.com" autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label for="ds-api-key">DeepSeek API Key</label>
+                <input type="password" id="ds-api-key" placeholder="sk-..." autocomplete="off">
+            </div>
+        </div>
+        
+        <div style="display: flex; gap: 1rem; margin-top: 1rem;">
             <button class="btn" id="btn-detect" onclick="detectModels()">
                 <span class="loader"></span>
                 <span>智能扫描与探针验活</span>
@@ -407,6 +419,11 @@
                     document.getElementById('base-url').value = data.third_party.base_url;
                 }
                 
+                if (data.deepseek && data.deepseek.api_key) {
+                    if (data.deepseek.base_url) document.getElementById('ds-base-url').value = data.deepseek.base_url;
+                    // Optional: show partial key or just leave password field blank
+                }
+                
                 // Fetch external models dynamically from proxy if /v1/models is alive
                 try {
                     const extResp = await fetch("/v1/models");
@@ -481,6 +498,9 @@
         const baseUrl = document.getElementById('base-url').value.trim();
         const apiKey = document.getElementById('api-key').value.trim();
         
+        const dsBaseUrl = document.getElementById('ds-base-url').value.trim();
+        const dsApiKey = document.getElementById('ds-api-key').value.trim();
+        
         const btn = document.getElementById('btn-save');
         btn.classList.add('loading');
         btn.disabled = true;
@@ -489,7 +509,12 @@
             const resp = await fetch("/api/config/update", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ base_url: baseUrl, api_key: apiKey })
+                body: JSON.stringify({ 
+                    base_url: baseUrl, 
+                    api_key: apiKey,
+                    ds_base_url: dsBaseUrl,
+                    ds_api_key: dsApiKey
+                })
             });
             const data = await resp.json();
             if (resp.ok) {
