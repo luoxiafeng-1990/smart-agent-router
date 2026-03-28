@@ -21,6 +21,8 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from contextlib import asynccontextmanager
+import asyncio
 
 from dotenv import load_dotenv
 import dotenv
@@ -120,13 +122,13 @@ _model_cache: dict = {}
 _model_cache_ts: float = 0
 
 
-def _discover_ls() -> tuple[int, str]:
+async def _discover_ls() -> tuple[int, str]:
     """扫描进程表，找到 Antigravity language server 的端口和 CSRF token。"""
     global _ls_port, _ls_csrf
     if _ls_port and _ls_csrf:
         return _ls_port, _ls_csrf
 
-    cmdline = subprocess.check_output(["ps", "aux"], text=True)
+    cmdline = await asyncio.to_thread(subprocess.check_output, ["ps", "aux"], text=True)
     for line in cmdline.splitlines():
         if "language_server_linux_x64" not in line or "--csrf_token" not in line:
             continue
@@ -135,7 +137,7 @@ def _discover_ls() -> tuple[int, str]:
             continue
         csrf = m.group(1)
         pid = int(line.split()[1])
-        port = _find_http_port(pid, csrf)
+        port = await _find_http_port(pid, csrf)
         if port:
             _ls_port = port
             _ls_csrf = csrf
@@ -172,24 +174,25 @@ def _get_pid_ports(pid: int) -> list[int]:
     return sorted(list(ports))
 
 
-def _find_http_port(pid: int, csrf: str) -> Optional[int]:
+async def _find_http_port(pid: int, csrf: str) -> Optional[int]:
     """尝试各端口，找到能响应 Heartbeat 的 HTTP 端口。"""
     headers = {
         "Content-Type": "application/json",
         "x-codeium-csrf-token": csrf,
         "Connect-Protocol-Version": "1",
     }
-    for port in _get_pid_ports(pid):
-        try:
-            with httpx.Client(trust_env=False) as client:
-                r = client.post(
+    ports = await asyncio.to_thread(_get_pid_ports, pid)
+    async with httpx.AsyncClient() as client:
+        for port in ports:
+            try:
+                r = await client.post(
                     f"http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/Heartbeat",
                     json={}, headers=headers, timeout=2,
                 )
                 if r.status_code == 200:
                     return port
-        except Exception:
-            continue
+            except Exception:
+                continue
     return None
 
 
@@ -200,18 +203,18 @@ def _reset_ls():
     _model_cache_ts = 0
 
 
-def _call_ls(method: str, body: dict, timeout: float = 120) -> dict:
+async def _call_ls(method: str, body: dict, timeout: float = 120) -> dict:
     """向 language server 发起 RPC 调用。"""
-    port, csrf = _discover_ls()
+    port, csrf = await _discover_ls()
     url = f"http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/{method}"
     headers = {
         "Content-Type": "application/json",
         "x-codeium-csrf-token": csrf,
         "Connect-Protocol-Version": "1",
     }
+    client = _http_client or httpx.AsyncClient()
     try:
-        with httpx.Client(trust_env=False) as client:
-            r = client.post(url, json=body, headers=headers, timeout=timeout)
+        r = await client.post(url, json=body, headers=headers, timeout=timeout)
     except httpx.ConnectError:
         _reset_ls()
         raise RuntimeError("Antigravity language server 连接断开，请检查 Antigravity 是否运行")
@@ -225,7 +228,10 @@ def _call_ls(method: str, body: dict, timeout: float = 120) -> dict:
 
 
 # ─────────────────────────── 模型管理 ───────────────────────────────
-def _fetch_models() -> dict:
+def _label_to_id(label: str) -> str:
+    return label.lower().replace(" ", "-").replace("(", "").replace(")", "").strip("-")
+
+async def _fetch_models() -> dict:
     """动态从 language server 获取可用模型列表，缓存 60 秒。"""
     global _model_cache, _model_cache_ts
     if time.time() - _model_cache_ts < 60 and _model_cache:
@@ -234,7 +240,7 @@ def _fetch_models() -> dict:
     models = {}
     for rpc in ["GetCascadeModelConfigData", "GetCommandModelConfigs"]:
         try:
-            data = _call_ls(rpc, {})
+            data = await _call_ls(rpc, {})
         except Exception as e:
             logger.warning(f"获取模型列表失败 ({rpc}): {e}")
             continue
@@ -269,13 +275,9 @@ def _fetch_models() -> dict:
     return models
 
 
-def _label_to_id(label: str) -> str:
-    return label.lower().replace(" ", "-").replace("(", "").replace(")", "").strip("-")
-
-
-def _resolve_model(model_id: str) -> str:
+async def _resolve_model(model_id: str) -> str:
     """将 Cursor 传来的模型名解析为 language server 内部 key。"""
-    models = _fetch_models()
+    models = await _fetch_models()
     normalized = model_id.lower().strip()
 
     if normalized in models:
@@ -478,7 +480,16 @@ def _parse_tool_calls(text: str) -> tuple[Optional[str], list[dict]]:
 
 
 # ───────────────────────────── FastAPI App ──────────────────────────
-app = FastAPI(title="Antigravity Proxy", version="5.0.0")
+_http_client: Optional[httpx.AsyncClient] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _http_client
+    _http_client = httpx.AsyncClient(timeout=120, limits=httpx.Limits(max_keepalive_connections=100))
+    yield
+    await _http_client.aclose()
+
+app = FastAPI(title="Antigravity Proxy", version="5.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -501,8 +512,8 @@ async def root():
 @app.get("/api/status")
 async def get_status():
     try:
-        port, _ = _discover_ls()
-        models = _fetch_models()
+        port, _ = await _discover_ls()
+        models = await _fetch_models()
     except Exception:
         port, models = None, {}
     return {
@@ -589,7 +600,7 @@ async def discover_models(request: Request):
 @app.get("/health")
 async def health():
     try:
-        port, _ = _discover_ls()
+        port, _ = await _discover_ls()
         return {"status": "ok", "ls_port": port}
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=503)
@@ -600,7 +611,7 @@ async def list_models(request: Request):
     if not _check_auth(request):
         return JSONResponse({"error": {"message": "Unauthorized"}}, status_code=401)
     try:
-        models = _fetch_models()
+        models = await _fetch_models()
     except Exception as e:
         return JSONResponse({"error": {"message": str(e)}}, status_code=502)
         
@@ -661,7 +672,7 @@ async def chat_completions(request: Request):
 
     # 解析模型
     try:
-        internal_key = _resolve_model(model_id)
+        internal_key = await _resolve_model(model_id)
     except ValueError as e:
         return JSONResponse({"error": {"message": str(e)}}, status_code=400)
 
@@ -671,7 +682,7 @@ async def chat_completions(request: Request):
 
     # 调用 language server
     try:
-        result = _call_ls("GetModelResponse", {"model": internal_key, "prompt": prompt})
+        result = await _call_ls("GetModelResponse", {"model": internal_key, "prompt": prompt})
     except RuntimeError as e:
         logger.error(f"[{req_id}] language server 错误: {e}")
         err_msg = f"\n\n🚨 [Antigravity Proxy 网关截获报错]\n底层引擎拒绝服务: {e}\n\n💡 诊断：通常由于 Antigravity 该模型当前并发超载或账号额度被抽空。\n建议：请转到 Web 控制台添加 [第三方代理 API] 并改用外部商业模型！"
@@ -818,7 +829,9 @@ async def _forward_openai_to_external_openai(req_id: str, body: dict, stream: bo
                 msg["content"] = "\n".join(text_buffer)
                 
     async def _stream_proxy():
-        async with httpx.AsyncClient(timeout=120) as client:
+        client = _http_client or httpx.AsyncClient()
+        # To avoid massive reindentation, we artificially scope this with 'if True:' or simply reindent:
+        if client: # keep indent level of 'async with'
             try:
                 # 记录请求
                 logger.debug(f"[{req_id}] POST {url} (model={model_id})")
