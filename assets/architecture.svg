@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" width="100%" height="450">
+  <defs>
+    <!-- CSS Animations and Styles -->
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&amp;display=swap');
+      
+      text { font-family: 'Inter', -apple-system, sans-serif; }
+      
+      .bg { fill: #0d1117; }
+      
+      .box { fill: #161b22; stroke-width: 2; rx: 12; transition: all 0.3s ease; }
+      .box:hover { filter: drop-shadow(0 0 15px rgba(255,255,255,0.1)); cursor: pointer; }
+      
+      .box-blue { stroke: #58a6ff; }
+      .box-green { stroke: #3fb950; }
+      .box-purple { stroke: #bc8cff; }
+      .box-orange { stroke: #ea5a00; }
+      
+      .title { fill: #c9d1d9; font-size: 18px; font-weight: 800; text-anchor: middle; alignment-baseline: middle; }
+      .subtitle { fill: #8b949e; font-size: 13px; font-weight: 400; text-anchor: middle; alignment-baseline: middle; }
+      
+      .path { fill: none; stroke: #30363d; stroke-width: 3; stroke-linecap: round; }
+      .path-animated-blue { stroke: #58a6ff; stroke-width: 3; stroke-dasharray: 8 8; animation: dash 3s linear infinite; fill: none; }
+      .path-animated-green { stroke: #3fb950; stroke-width: 3; stroke-dasharray: 8 8; animation: dash-reverse 3s linear infinite; fill: none; }
+      
+      @keyframes dash { to { stroke-dashoffset: -100; } }
+      @keyframes dash-reverse { to { stroke-dashoffset: 100; } }
+      
+      /* Glowing orbs representing data packets */
+      .orb-req { fill: #58a6ff; filter: drop-shadow(0 0 8px #58a6ff); }
+      .orb-res { fill: #3fb950; filter: drop-shadow(0 0 8px #3fb950); }
+      
+      /* Pulse effect for the central router */
+      .pulse-ring { fill: none; stroke: #3fb950; stroke-width: 2; animation: ripple 2s cubic-bezier(0.215, 0.61, 0.355, 1) infinite; }
+      @keyframes ripple {
+        0% { transform: scale(0.95); opacity: 1; stroke-width: 4; }
+        100% { transform: scale(1.1); opacity: 0; stroke-width: 1; }
+      }
+
+      /* Hover text popup container */
+      .tooltip { opacity: 0; fill: #c9d1d9; font-size: 13px; transition: opacity 0.3s; pointer-events: none; text-anchor: middle;}
+      .g-hover:hover .tooltip { opacity: 1; }
+    </style>
+  </defs>
+
+  <rect width="100%" height="100%" class="bg" rx="16" />
+
+  <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+    <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#21262d" stroke-width="0.5"/>
+  </pattern>
+  <rect width="100%" height="100%" fill="url(#grid)" />
+
+  <path d="M 400 110 L 400 190" class="path" />
+  <path d="M 400 110 L 400 190" class="path-animated-blue" />
+  <path d="M 380 190 L 380 110" class="path-animated-green" />
+
+  <path d="M 360 270 C 360 320, 220 310, 220 350" class="path" />
+  <path d="M 360 270 C 360 320, 220 310, 220 350" class="path-animated-blue" />
+  <path d="M 240 350 C 240 310, 380 320, 380 270" class="path-animated-green" />
+
+  <path d="M 440 270 C 440 320, 580 310, 580 350" class="path" />
+  <path d="M 440 270 C 440 320, 580 310, 580 350" class="path-animated-blue" />
+  <path d="M 600 350 C 600 310, 460 320, 460 270" class="path-animated-green" />
+
+  <circle r="5" class="orb-req">
+    <animateMotion dur="1.5s" repeatCount="indefinite" path="M 400 110 L 400 190" />
+  </circle>
+  <circle r="5" class="orb-res">
+    <animateMotion dur="1.5s" repeatCount="indefinite" path="M 380 190 L 380 110" />
+  </circle>
+
+  <circle r="5" class="orb-req">
+    <animateMotion dur="2s" repeatCount="indefinite" path="M 360 270 C 360 320, 220 310, 220 350" />
+  </circle>
+  <circle r="5" class="orb-res">
+    <animateMotion dur="2s" repeatCount="indefinite" path="M 240 350 C 240 310, 380 320, 380 270" />
+  </circle>
+
+  <circle r="5" class="orb-req">
+    <animateMotion dur="2s" begin="0.8s" repeatCount="indefinite" path="M 440 270 C 440 320, 580 310, 580 350" />
+  </circle>
+  <circle r="5" class="orb-res">
+    <animateMotion dur="2s" begin="0.8s" repeatCount="indefinite" path="M 600 350 C 600 310, 460 320, 460 270" />
+  </circle>
+
+  <g class="g-hover" transform="translate(280, 50)">
+    <rect width="240" height="60" class="box box-blue" />
+    <text x="120" y="26" class="title">💻 Cursor / Claude Code</text>
+    <text x="120" y="46" class="subtitle">AI Assistant Client (Agentic)</text>
+    <rect x="-30" y="-35" width="300" height="25" fill="#161b22" rx="4" stroke="#58a6ff" class="tooltip"/>
+    <text x="120" y="-18" class="tooltip">Sends OpenAI/Anthropic spec requests</text>
+  </g>
+
+  <g class="g-hover" transform="translate(260, 190)">
+    <!-- Router box -->
+    <rect width="280" height="80" rx="12" class="pulse-ring" />
+    <rect width="280" height="80" class="box box-green" />
+    <text x="140" y="28" class="title">🧠 Smart Agent Router</text>
+    <text x="140" y="50" class="subtitle">SSRF Bypass &amp; Tag Interception</text>
+    <text x="140" y="65" class="subtitle" font-size="10" fill="#3fb950" font-weight="bold">Active Stream Decoding</text>
+    
+    <rect x="-20" y="-35" width="320" height="25" fill="#161b22" rx="4" stroke="#3fb950" class="tooltip"/>
+    <text x="140" y="-18" class="tooltip">Repairs broken tags &amp; routes LLM calls</text>
+  </g>
+
+  <g class="g-hover" transform="translate(100, 350)">
+    <rect width="240" height="60" class="box box-purple" />
+    <text x="120" y="26" class="title">🗄️ Local Target</text>
+    <text x="120" y="46" class="subtitle">Antigravity / Local LLMs</text>
+    <rect x="-10" y="75" width="260" height="25" fill="#161b22" rx="4" stroke="#bc8cff" class="tooltip"/>
+    <text x="120" y="92" class="tooltip">Zero API key cost, reverse engineered</text>
+  </g>
+
+  <g class="g-hover" transform="translate(460, 350)">
+    <rect width="240" height="60" class="box box-orange" />
+    <text x="120" y="26" class="title">☁️ External APIs</text>
+    <text x="120" y="46" class="subtitle">OpenAI / Anthropic Proxies</text>
+    <rect x="0" y="75" width="240" height="25" fill="#161b22" rx="4" stroke="#ea5a00" class="tooltip"/>
+    <text x="120" y="92" class="tooltip">Failsafe fallback &amp; Third-party APIs</text>
+  </g>
+
+  <g transform="translate(360, 120)">
+    <rect width="80" height="22" rx="4" fill="#21262d" stroke="#30363d" stroke-width="1" />
+    <text x="40" y="16" font-size="11" font-weight="600" fill="#58a6ff" text-anchor="middle">Port 8787</text>
+  </g>
+
+  <text x="780" y="430" font-size="12" fill="#484f58" font-family="monospace" text-anchor="end">Antigravity Intelligent Routing Architecture</text>
+</svg>
