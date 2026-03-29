@@ -683,24 +683,34 @@ async def chat_completions(request: Request):
     except ValueError as e:
         return JSONResponse({"error": {"message": str(e)}}, status_code=400)
 
-    # 构建 prompt
-    prompt = _build_prompt(messages, tools)
-    jlog(req_id, "proxy→ls", {"model": internal_key, "prompt_chars": len(prompt)})
-
-    # 调用 language server 带着防爆 503 重试机制
     max_retries = 3
     for attempt in range(max_retries):
         try:
+            # 构建 prompt (放到循环内以便支持动态重压缩机制)
+            prompt = _build_prompt(messages, tools)
+            if attempt == 0:
+                jlog(req_id, "proxy→ls", {"model": internal_key, "prompt_chars": len(prompt)})
+                
             result = await _call_ls("GetModelResponse", {"model": internal_key, "prompt": prompt})
             break
         except RuntimeError as e:
-            if "503" in str(e) and attempt < max_retries - 1:
-                logger.warning(f"[{req_id}] 引擎 503 限流, {attempt+1}/{max_retries} 次重试等待中...")
+            err_str = str(e)
+            is_overload = "503" in err_str or "500" in err_str or "Timeout" in err_str or "connection" in err_str.lower()
+            
+            if is_overload and attempt < max_retries - 1:
+                logger.warning(f"[{req_id}] 本地引擎限流或 500 故障 ({err_str}), 触发自动压缩重试 ({attempt+1}/{max_retries})...")
+                if len(messages) > 6:
+                    sys_msgs = [m for m in messages if m.get("role") == "system"]
+                    other_msgs = [m for m in messages if m.get("role") != "system"]
+                    # 每次重试抛弃最老的数条中间历史对话
+                    keep = max(4, len(other_msgs) - (attempt + 2))
+                    messages = sys_msgs + other_msgs[-keep:]
+                    
                 await asyncio.sleep(2 + attempt * 2)
                 continue
                 
             logger.error(f"[{req_id}] language server 错误: {e}")
-            err_msg = f"\n\n🚨 [Antigravity Proxy 网关截获报错]\n底层引擎拒绝服务: {e}\n\n💡 诊断：通常由于 Antigravity 该模型当前并发超载或账号额度被抽空。\n建议：请转到 Web 控制台添加 [第三方代理 API] 并改用外部商业模型！"
+            err_msg = f"\n\n🚨 [Antigravity Proxy 网关截获报错]\n本地底层引擎崩溃或拒绝服务: {e}\n\n💡 诊断：这通常是因为发过去的日志过长，导致本地后端组件段错误或处理超时（经过多次压缩后仍无法抢救）。\n建议：请在 Cursor 里新建聊天 (New Chat)，重新用短请求要求 AI '继续完成任务'！或者转外网大模型。"
             if stream:
                 return StreamingResponse(
                     _stream_response(f"err-{uuid.uuid4().hex[:8]}", int(time.time()), model_id, err_msg, []),
