@@ -218,6 +218,10 @@ async def _call_ls(method: str, body: dict, timeout: float = 120) -> dict:
     except httpx.ConnectError:
         _reset_ls()
         raise RuntimeError("Antigravity language server 连接断开，请检查 Antigravity 是否运行")
+    except httpx.TimeoutException:
+        raise RuntimeError(f"Antigravity language server 处理超时 (Timeout: {timeout}s 当前上下文极长或引擎假死)")
+    except Exception as e:
+        raise RuntimeError(f"Antigravity language server 请求发生异常: {e}")
 
     if r.status_code == 404:
         raise RuntimeError(f"方法 {method} 不存在")
