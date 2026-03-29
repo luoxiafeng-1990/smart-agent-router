@@ -303,26 +303,25 @@
         <h2 class="panel-title">☁️ 添加外部超脑 (第三方 API 配置)</h2>
         <p class="subtitle" style="margin-bottom: 1.5rem;">配置市面上更低廉的渠道商，让游离大模型替你编程。该配置将动态覆盖 <code>.env</code> 文件且热重载生效。</p>
         
-        <div class="form-row">
-            <div class="form-group">
-                <label for="base-url">Anthropic/通用代理 Base URL (如 apiclaw.ai)</label>
-                <input type="text" id="base-url" placeholder="https://api.example.com" autocomplete="off">
-            </div>
-            <div class="form-group">
-                <label for="api-key">API Key (凭证)</label>
-                <input type="password" id="api-key" placeholder="sk-..." autocomplete="off">
+        <div class="form-row" style="margin-bottom: 1rem;">
+            <div class="form-group" style="flex: 0.3;">
+                <label for="provider-select">代理服务商 (Provider)</label>
+                <select id="provider-select" onchange="providerChanged()">
+                    <option value="anthropic">Anthropic / 通用反代 (默认)</option>
+                    <option value="deepseek">DeepSeek 官方直击</option>
+                    <option value="openai">OpenAI 通用服务</option>
+                </select>
             </div>
         </div>
         
-        <h3 style="font-size: 0.9rem; color: #58a6ff; margin: 1rem 0; text-transform: uppercase;">🐋 DeepSeek 专属通道</h3>
         <div class="form-row">
-            <div class="form-group">
-                <label for="ds-base-url">DeepSeek Base URL</label>
-                <input type="text" id="ds-base-url" placeholder="https://api.deepseek.com" value="https://api.deepseek.com" autocomplete="off">
+            <div class="form-group" style="flex: 1;">
+                <label for="base-url" id="lbl-base-url">对应服务商 Base URL</label>
+                <input type="text" id="base-url" placeholder="https://api.example.com" autocomplete="off">
             </div>
-            <div class="form-group">
-                <label for="ds-api-key">DeepSeek API Key</label>
-                <input type="password" id="ds-api-key" placeholder="sk-..." autocomplete="off">
+            <div class="form-group" style="flex: 1;">
+                <label for="api-key" id="lbl-api-key">对应 API Key (凭证)</label>
+                <input type="password" id="api-key" placeholder="sk-..." autocomplete="off">
             </div>
         </div>
         
@@ -415,14 +414,14 @@
                 
                 G_STATE.local = data.local_models || [];
                 
-                if (data.third_party.base_url) {
-                    document.getElementById('base-url').value = data.third_party.base_url;
-                }
+                // Store configs globally to switch states
+                G_STATE.configs = {
+                    anthropic: data.third_party || {base_url: '', api_key: ''},
+                    deepseek: data.deepseek || {base_url: 'https://api.deepseek.com', api_key: ''},
+                    openai: data.openai || {base_url: '', api_key: ''}
+                };
                 
-                if (data.deepseek && data.deepseek.api_key) {
-                    if (data.deepseek.base_url) document.getElementById('ds-base-url').value = data.deepseek.base_url;
-                    // Optional: show partial key or just leave password field blank
-                }
+                providerChanged();
                 
                 // Fetch external models dynamically from proxy if /v1/models is alive
                 try {
@@ -450,12 +449,26 @@
         logger.innerText += msg + "\n";
     }
 
+    function providerChanged() {
+        if (!G_STATE.configs) return;
+        const provider = document.getElementById('provider-select').value;
+        const cfg = G_STATE.configs[provider] || {base_url: "", api_key: ""};
+        
+        document.getElementById('base-url').value = cfg.base_url || "";
+        document.getElementById('api-key').value = ""; // Protect API key
+        
+        if (provider === "deepseek" && !document.getElementById('base-url').value) {
+            document.getElementById('base-url').value = "https://api.deepseek.com";
+        }
+    }
+
     async function detectModels() {
+        const provider = document.getElementById('provider-select').value;
         const baseUrl = document.getElementById('base-url').value.trim();
         const apiKey = document.getElementById('api-key').value.trim();
         
         if (!baseUrl || !apiKey) {
-            alert("请填入完整的 Base URL 和 API Key！\n如果你使用的是便宜代理比如 apiclaw.ai，请一并填入。");
+            alert("请填入完整的 Base URL 和 API Key！");
             return;
         }
 
@@ -479,7 +492,7 @@
 
             logToUI(`✓ 成功捕获对方全量模型：共 ${data.models.length} 个`);
             if (data.probed_success && data.probed_success.length > 0) {
-                logToUI(`🔥 并发连通性探针测试成功！代表性模型 (如 Claude/GPT): [${data.probed_success.join(", ")}] 真实心跳存活！`);
+                logToUI(`🔥 并发连通性探针测试成功！存活模型探测：[${data.probed_success.join(", ")}] 真实心跳响应成功！`);
             }
 
             G_STATE.remote = data.models;
@@ -495,11 +508,14 @@
     }
 
     async function saveConfig() {
+        const provider = document.getElementById('provider-select').value;
         const baseUrl = document.getElementById('base-url').value.trim();
         const apiKey = document.getElementById('api-key').value.trim();
         
-        const dsBaseUrl = document.getElementById('ds-base-url').value.trim();
-        const dsApiKey = document.getElementById('ds-api-key').value.trim();
+        if (!baseUrl && !apiKey) {
+            alert("没有任何可保存的修改！");
+            return;
+        }
         
         const btn = document.getElementById('btn-save');
         btn.classList.add('loading');
@@ -510,18 +526,21 @@
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ 
+                    provider: provider,
                     base_url: baseUrl, 
-                    api_key: apiKey,
-                    ds_base_url: dsBaseUrl,
-                    ds_api_key: dsApiKey
+                    api_key: apiKey
                 })
             });
             const data = await resp.json();
-            if (resp.ok) {
-                alert(data.message);
-                await checkStatus(); // Reload
+            if (resp.ok && data.status === "ok") {
+                alert("✨ " + data.message);
+                if (G_STATE.configs && G_STATE.configs[provider]) {
+                    if (baseUrl) G_STATE.configs[provider].base_url = baseUrl;
+                    if (apiKey) G_STATE.configs[provider].api_key = apiKey;
+                }
+                await checkStatus(); // Reload UI
             } else {
-                alert("保存失败：" + (data.error || "未知错误"));
+                alert("保存报错：" + (data.message || data.error || "未知网络错误"));
             }
         } catch (e) {
             alert("保存请求发送失败: " + e.message);

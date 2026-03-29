@@ -538,28 +538,34 @@ async def update_config(request: Request):
     global EXTERNAL_ANTHROPIC_BASE_URL, EXTERNAL_ANTHROPIC_API_KEY
     global EXTERNAL_DEEPSEEK_BASE_URL, EXTERNAL_DEEPSEEK_API_KEY
     data = await request.json()
+    provider = data.get("provider", "").strip().lower()
     new_url = data.get("base_url", "").strip().rstrip("/")
     new_key = data.get("api_key", "").strip()
-    ds_url = data.get("ds_base_url", "").strip().rstrip("/")
-    ds_key = data.get("ds_api_key", "").strip()
     
+    if not provider:
+        return {"status": "error", "message": "Missing provider info"}
+        
     env_file = ".env"
     if not os.path.exists(env_file):
         with open(env_file, "w") as f: pass
     
-    if new_url or new_key:
-        if new_url: dotenv.set_key(env_file, "EXTERNAL_ANTHROPIC_BASE_URL", new_url)
-        if new_key: dotenv.set_key(env_file, "EXTERNAL_ANTHROPIC_API_KEY", new_key)
+    # 动态写入 `.env` 并反射修改全局变量
+    var_url = f"EXTERNAL_{provider.upper()}_BASE_URL"
+    var_key = f"EXTERNAL_{provider.upper()}_API_KEY"
+    
+    if new_url: dotenv.set_key(env_file, var_url, new_url)
+    if new_key: dotenv.set_key(env_file, var_key, new_key)
+    
+    # 手动重载当前内存变量 (仅处理已知的两大主干)
+    global EXTERNAL_ANTHROPIC_BASE_URL, EXTERNAL_ANTHROPIC_API_KEY, EXTERNAL_DEEPSEEK_BASE_URL, EXTERNAL_DEEPSEEK_API_KEY
+    if provider == "anthropic":
         EXTERNAL_ANTHROPIC_BASE_URL = new_url or EXTERNAL_ANTHROPIC_BASE_URL
         EXTERNAL_ANTHROPIC_API_KEY = new_key or EXTERNAL_ANTHROPIC_API_KEY
-        
-    if ds_url or ds_key:
-        if ds_url: dotenv.set_key(env_file, "EXTERNAL_DEEPSEEK_BASE_URL", ds_url)
-        if ds_key: dotenv.set_key(env_file, "EXTERNAL_DEEPSEEK_API_KEY", ds_key)
-        EXTERNAL_DEEPSEEK_BASE_URL = ds_url or EXTERNAL_DEEPSEEK_BASE_URL
-        EXTERNAL_DEEPSEEK_API_KEY = ds_key or EXTERNAL_DEEPSEEK_API_KEY
+    elif provider == "deepseek":
+        EXTERNAL_DEEPSEEK_BASE_URL = new_url or EXTERNAL_DEEPSEEK_BASE_URL
+        EXTERNAL_DEEPSEEK_API_KEY = new_key or EXTERNAL_DEEPSEEK_API_KEY
     
-    return {"status": "ok", "message": "代理配置已保存并热生效！"}
+    return {"status": "ok", "message": f"{provider.capitalize()} 代理配置已保存并热生效！"}
 
 @app.post("/api/models/discover")
 async def discover_models(request: Request):
@@ -571,11 +577,12 @@ async def discover_models(request: Request):
         return JSONResponse({"error": "缺少 Base URL 或 API Key"}, status_code=400)
         
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        client = _http_client or httpx.AsyncClient(timeout=10)
+        if client: # scoped properly
             resp = await client.get(f"{base_url}/v1/models", headers={"Authorization": f"Bearer {api_key}"})
             if resp.status_code != 200:
-                err = resp.text[:100]
-                return JSONResponse({"error": f"目标端异常 {resp.status_code}: {err}"}, status_code=502)
+                err = await resp.aread()
+                return JSONResponse({"error": f"目标端异常 {resp.status_code}: {err.decode('utf-8')[:100]}"}, status_code=502)
                 
             remote_models = [m.get("id") for m in resp.json().get("data", [])]
             
@@ -680,18 +687,26 @@ async def chat_completions(request: Request):
     prompt = _build_prompt(messages, tools)
     jlog(req_id, "proxy→ls", {"model": internal_key, "prompt_chars": len(prompt)})
 
-    # 调用 language server
-    try:
-        result = await _call_ls("GetModelResponse", {"model": internal_key, "prompt": prompt})
-    except RuntimeError as e:
-        logger.error(f"[{req_id}] language server 错误: {e}")
-        err_msg = f"\n\n🚨 [Antigravity Proxy 网关截获报错]\n底层引擎拒绝服务: {e}\n\n💡 诊断：通常由于 Antigravity 该模型当前并发超载或账号额度被抽空。\n建议：请转到 Web 控制台添加 [第三方代理 API] 并改用外部商业模型！"
-        if stream:
-            return StreamingResponse(
-                _stream_response(f"err-{uuid.uuid4().hex[:8]}", int(time.time()), model_id, err_msg, []),
-                media_type="text/event-stream"
-            )
-        return JSONResponse({"error": {"message": str(e)}}, status_code=502)
+    # 调用 language server 带着防爆 503 重试机制
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            result = await _call_ls("GetModelResponse", {"model": internal_key, "prompt": prompt})
+            break
+        except RuntimeError as e:
+            if "503" in str(e) and attempt < max_retries - 1:
+                logger.warning(f"[{req_id}] 引擎 503 限流, {attempt+1}/{max_retries} 次重试等待中...")
+                await asyncio.sleep(2 + attempt * 2)
+                continue
+                
+            logger.error(f"[{req_id}] language server 错误: {e}")
+            err_msg = f"\n\n🚨 [Antigravity Proxy 网关截获报错]\n底层引擎拒绝服务: {e}\n\n💡 诊断：通常由于 Antigravity 该模型当前并发超载或账号额度被抽空。\n建议：请转到 Web 控制台添加 [第三方代理 API] 并改用外部商业模型！"
+            if stream:
+                return StreamingResponse(
+                    _stream_response(f"err-{uuid.uuid4().hex[:8]}", int(time.time()), model_id, err_msg, []),
+                    media_type="text/event-stream"
+                )
+            return JSONResponse({"error": {"message": str(e)}}, status_code=502)
 
     raw_text = result.get("response", "")
     jlog(req_id, "ls→proxy", {"response_chars": len(raw_text), "preview": raw_text[:200]})
@@ -803,9 +818,18 @@ async def _forward_openai_to_external_openai(req_id: str, body: dict, stream: bo
     """直接转发 OpenAI 格式请求给第三方代理，带破损 Claude 内部 tool tag 拦截修复机制"""
     model_id = body.get("model", "")
     is_ds = "deepseek" in model_id.lower()
+    is_openai = "-openai" in EXTERNAL_ANTHROPIC_BASE_URL.lower() or "openai" in req_id
     
-    base_url = EXTERNAL_DEEPSEEK_BASE_URL if is_ds else EXTERNAL_ANTHROPIC_BASE_URL
-    api_key = EXTERNAL_DEEPSEEK_API_KEY if is_ds else EXTERNAL_ANTHROPIC_API_KEY
+    if is_ds:
+        base_url = EXTERNAL_DEEPSEEK_BASE_URL
+        api_key = EXTERNAL_DEEPSEEK_API_KEY
+    elif provider_hint == "openai" if 'provider_hint' in locals() else ("openai" in EXTERNAL_ANTHROPIC_BASE_URL.lower()):
+        # Quick fallback if the URL seems like openai generic
+        base_url = EXTERNAL_ANTHROPIC_BASE_URL
+        api_key = EXTERNAL_ANTHROPIC_API_KEY
+    else:
+        base_url = EXTERNAL_ANTHROPIC_BASE_URL
+        api_key = EXTERNAL_ANTHROPIC_API_KEY
 
     url = f"{base_url}/v1/chat/completions"
     forward_headers = {
@@ -870,17 +894,30 @@ async def _forward_openai_to_external_openai(req_id: str, body: dict, stream: bo
                             except Exception:
                                 continue
                                 
+                            if "error" in data:
+                                yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+                                
                             choices = data.get("choices", [])
                             if not choices:
                                 continue
+                                
+                            if is_ds:
+                                # 强制使用统一生成的 completion_id，避免 Cursor 断流
+                                data["id"] = completion_id
+                                yield "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
+                                continue
+                                
                             delta = choices[0].get("delta", {})
                             
                             # 1. 代理原本就正确返回的 tool_calls 走这
                             if "tool_calls" in delta:
-                                yield line + "\n\n"
+                                data["id"] = completion_id
+                                yield "data: " + json.dumps(data, ensure_ascii=False) + "\n\n"
                                 continue
                                 
-                            # 2. 对 content_delta 进行强大容错过滤 (修复 apiclaw 没有拦截原生 tool tag 或自定义 tag 的现象)
+                            # 2. 对 content_delta 进行强大容错过滤
                             if "content" in delta and delta["content"]:
                                 buffer += delta["content"]
                                 
@@ -950,6 +987,11 @@ async def _forward_openai_to_external_openai(req_id: str, body: dict, stream: bo
                             # 3. 转发结束信号
                             finish_reason = choices[0].get("finish_reason")
                             if finish_reason:
+                                if not is_ds and buffer:
+                                    # 残渣净化：Anthropic 最后经常吐出 </tool_call> 等半残片，直接忽略末尾包含 tag 特征的片段
+                                    if not any(tag in buffer for tag in ["<", ">", "</"]):
+                                        yield _chunk({"content": buffer})
+                                    buffer = ""
                                 yield _chunk({}, finish_reason=finish_reason)
             except Exception as e:
                 logger.error(f"[{req_id}] 外部流转发中断: {e}")
