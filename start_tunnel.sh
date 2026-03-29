@@ -46,7 +46,7 @@ echo "🌐 正在创建免费的 Cloudflare 隧道..."
 rm -f tunnel.log
 
 # 启动并在后台运行，将日志输出到文件
-$CLOUDFLARED tunnel --url http://localhost:$PORT > tunnel.log 2>&1 &
+TUNNEL_PROTOCOL=http2 $CLOUDFLARED tunnel --url http://localhost:$PORT > tunnel.log 2>&1 &
 TUNNEL_PID=$!
 
 # 等待获取 URL

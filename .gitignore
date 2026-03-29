@@ -3,3 +3,5 @@ cloudflared
 opus_test*.json
 *.log
 __pycache__/
+.venv/
+logs/
