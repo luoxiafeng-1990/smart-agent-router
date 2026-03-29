@@ -852,18 +852,46 @@ async def _forward_openai_to_external_openai(req_id: str, body: dict, stream: bo
                         text_buffer.append(b.get("text", ""))
                 msg["content"] = "\n".join(text_buffer)
                 
-    async def _stream_proxy():
+    async def _stream_proxy(current_body=None, retry_count=0):
+        if current_body is None:
+            current_body = body
         client = _http_client or httpx.AsyncClient()
         # To avoid massive reindentation, we artificially scope this with 'if True:' or simply reindent:
         if client: # keep indent level of 'async with'
             try:
                 # 记录请求
-                logger.debug(f"[{req_id}] POST {url} (model={model_id})")
-                async with client.stream("POST", url, json=body, headers=forward_headers) as resp:
+                logger.debug(f"[{req_id}] POST {url} (model={model_id}) retry={retry_count}")
+                async with client.stream("POST", url, json=current_body, headers=forward_headers) as resp:
                     if resp.status_code != 200:
                         err = await resp.aread()
                         logger.error(f"[{req_id}] Proxy Error: {resp.status_code} {err.decode('utf-8')[:200]}")
-                        yield f"data: {json.dumps({'error': resp.status_code, 'message': err.decode('utf-8')})}\n\n"
+                        
+                        if resp.status_code in (400, 413, 500, 502, 503) and retry_count < 2:
+                            msgs = current_body.get("messages", [])
+                            if len(msgs) > 6:
+                                logger.warning(f"[{req_id}] 触发自动压缩上下文 (HTTP {resp.status_code})，舍弃最旧记录后重试...")
+                                sys_msgs = [m for m in msgs if m.get("role") == "system"]
+                                other_msgs = [m for m in msgs if m.get("role") != "system"]
+                                # 保留最近的几条历史（递减截断）
+                                keep = max(4, len(other_msgs) - 4)
+                                new_body = dict(current_body)
+                                new_body["messages"] = sys_msgs + other_msgs[-keep:]
+                                async for c in _stream_proxy(new_body, retry_count + 1):
+                                    yield c
+                                return
+                                
+                        err_msg = f"\n\n🚨 [Antigravity Proxy 网关截获报错]\n上游接口返回错误: HTTP {resp.status_code}\n(通常是由于多次执行工具导致积压了极大的终端日志，且网络自动重压缩后依然无法处理！请新建聊天或清理多余终端。)\n{err.decode('utf-8')[:300]}"
+                        yield "data: " + json.dumps({
+                            "id": completion_id, "object": "chat.completion.chunk",
+                            "created": created, "model": model_id,
+                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": err_msg}}]
+                        }, ensure_ascii=False) + "\n\n"
+                        yield "data: " + json.dumps({
+                            "id": completion_id, "object": "chat.completion.chunk",
+                            "created": created, "model": model_id,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                        }, ensure_ascii=False) + "\n\n"
+                        yield "data: [DONE]\n\n"
                         return
 
                     def _chunk(delta: dict, finish_reason=None):
@@ -992,10 +1020,25 @@ async def _forward_openai_to_external_openai(req_id: str, body: dict, stream: bo
                                     if not any(tag in buffer for tag in ["<", ">", "</"]):
                                         yield _chunk({"content": buffer})
                                     buffer = ""
+                                    
+                                if has_tool_emitted and finish_reason == "stop":
+                                    finish_reason = "tool_calls"
+                                    
                                 yield _chunk({}, finish_reason=finish_reason)
             except Exception as e:
                 logger.error(f"[{req_id}] 外部流转发中断: {e}")
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                err_msg = f"\n\n🚨 [Antigravity Proxy 网关保护]\n与第三方的流连接意外中断或挂起: {e}\n(如遇 Timeout 超时，通常说明单次请求了过长的日志或代码导致模型思考过久。请新建聊天或让AI自行清理输出！)\n\n"
+                yield "data: " + json.dumps({
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_id,
+                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": err_msg}}]
+                }, ensure_ascii=False) + "\n\n"
+                yield "data: " + json.dumps({
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_id,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }, ensure_ascii=False) + "\n\n"
+                yield "data: [DONE]\n\n"
 
     if stream:
         return StreamingResponse(_stream_proxy(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
