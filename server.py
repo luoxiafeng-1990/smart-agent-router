@@ -60,17 +60,20 @@ def _use_external_proxy(model_id: str) -> bool:
     """判断当前请求是否需要转发至第三方（而不是走本地免费的 Antigravity）"""
     normalized = model_id.lower().strip()
     
+    # 去掉 ag- 前缀
+    if normalized.startswith("ag-"):
+        normalized = normalized[3:]
+    
     is_deepseek = "deepseek" in normalized
     if is_deepseek and EXTERNAL_DEEPSEEK_API_KEY:
         return True
         
     if not is_deepseek and not EXTERNAL_ANTHROPIC_API_KEY:
         return False
-        
-    normalized = model_id.lower().strip()
     
     # 1. 带有 Antigravity 本源特征的，绝对走本地
-    if "4.6" in normalized or "antigravity" in normalized or "gemini" in normalized:
+    # 注意：Cursor 发来的版本号用连字符（如 claude-opus-4-6），需同时检查
+    if "4.6" in normalized or "4-6" in normalized or "antigravity" in normalized or "gemini" in normalized:
         return False
         
     # 2. 外部主流商用标准的，绝对走外部
@@ -78,14 +81,10 @@ def _use_external_proxy(model_id: str) -> bool:
     if any(normalized.startswith(p) for p in external_prefixes):
         return True
         
-    # 3. 检查是否精确存在于本地可用模型缓存中
-    try:
-        models = _fetch_models()
-        if normalized in models:
-            return False
-    except Exception:
-        pass
-        
+    # 3. 检查本地模型缓存（同步读缓存，不发 RPC）
+    if _model_cache and normalized in _model_cache:
+        return False
+
     # 兜底：如果用户只写了 claude，那就送给外面
     return "claude" in normalized
 
@@ -121,31 +120,81 @@ _ls_csrf: Optional[str] = None
 _model_cache: dict = {}
 _model_cache_ts: float = 0
 
+# 支持多种可能的进程名（Antigravity 更新后进程名可能改变）
+_LS_PROCESS_PATTERNS = [
+    "language_server_linux_x64",
+    "language_server_linux",
+    "antigravity_language_server",
+    "antigravity-language-server",
+    "language_server",
+]
+
+
+def _match_ls_process(line: str) -> bool:
+    """检查进程行是否匹配 Language Server 进程，同时必须包含 csrf_token 参数。"""
+    if "--csrf_token" not in line and "--csrf-token" not in line:
+        return False
+    line_lower = line.lower()
+    for pattern in _LS_PROCESS_PATTERNS:
+        if pattern in line_lower:
+            return True
+    return False
+
 
 async def _discover_ls() -> tuple[int, str]:
     """扫描进程表，找到 Antigravity language server 的端口和 CSRF token。"""
     global _ls_port, _ls_csrf
     if _ls_port and _ls_csrf:
-        return _ls_port, _ls_csrf
+        # 验证缓存的连接是否还活着
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    f"http://127.0.0.1:{_ls_port}/exa.language_server_pb.LanguageServerService/Heartbeat",
+                    json={}, headers={
+                        "Content-Type": "application/json",
+                        "x-codeium-csrf-token": _ls_csrf,
+                        "Connect-Protocol-Version": "1",
+                    }, timeout=2,
+                )
+                if r.status_code == 200:
+                    return _ls_port, _ls_csrf
+        except Exception:
+            logger.warning("⚠️ 缓存的 Language Server 连接失效，重新发现...")
+            _reset_ls()
 
-    cmdline = await asyncio.to_thread(subprocess.check_output, ["ps", "aux"], text=True)
+    try:
+        cmdline = await asyncio.to_thread(subprocess.check_output, ["ps", "aux"], text=True)
+    except Exception as e:
+        raise RuntimeError(f"无法执行 ps aux 命令: {e}")
+
+    candidates = []
     for line in cmdline.splitlines():
-        if "language_server_linux_x64" not in line or "--csrf_token" not in line:
+        if not _match_ls_process(line):
             continue
-        m = re.search(r"--csrf_token\s+(\S+)", line)
+        # 支持 --csrf_token 和 --csrf-token 两种写法
+        m = re.search(r"--csrf[_-]token\s+(\S+)", line)
         if not m:
             continue
         csrf = m.group(1)
         pid = int(line.split()[1])
+        candidates.append((pid, csrf, line.strip()[:120]))
+
+    for pid, csrf, line_preview in candidates:
         port = await _find_http_port(pid, csrf)
         if port:
             _ls_port = port
             _ls_csrf = csrf
-            logger.info(f"✅ 发现 language server: port={port} csrf={csrf[:8]}...")
+            logger.info(f"✅ 发现 language server: port={port} csrf={csrf[:8]}... (pid={pid})")
             return port, csrf
 
+    # 诊断信息
+    diag_lines = [l.strip()[:100] for l in cmdline.splitlines() if "language" in l.lower() or "antigravity" in l.lower() or "codeium" in l.lower() or "csrf" in l.lower()]
+    diag_msg = "\n".join(diag_lines[:5]) if diag_lines else "(无相关进程)"
     raise RuntimeError(
-        "找不到 Antigravity language server。请确认 Antigravity 正在运行，且你已登录会员账号。"
+        f"找不到 Antigravity language server 进程。\n"
+        f"请确认：1) Antigravity 正在运行  2) 你已登录会员账号\n"
+        f"搜索关键词: {_LS_PROCESS_PATTERNS}\n"
+        f"进程表相关行:\n{diag_msg}"
     )
 
 
@@ -274,6 +323,13 @@ async def _fetch_models() -> dict:
         if target in models and alias not in models:
             models[alias] = models[target]
 
+    # 自动生成连字符版别名（Cursor 不喜欢小数点，如 gemini-3.1 → gemini-3-1）
+    dot_models = {mid: info for mid, info in list(models.items()) if "." in mid}
+    for mid, info in dot_models.items():
+        hyphen_version = re.sub(r'(\d+)\.(\d+)', r'\1-\2', mid)
+        if hyphen_version != mid and hyphen_version not in models:
+            models[hyphen_version] = info
+
     _model_cache = models
     _model_cache_ts = time.time()
     return models
@@ -283,28 +339,39 @@ async def _resolve_model(model_id: str) -> str:
     """将 Cursor 传来的模型名解析为 language server 内部 key。"""
     models = await _fetch_models()
     normalized = model_id.lower().strip()
+    
+    # 去掉 ag- 前缀（Cursor 发来的模型名都带 ag- 前缀）
+    if normalized.startswith("ag-"):
+        normalized = normalized[3:]
+    
+    # Cursor 有时用连字符代替小数点（如 claude-opus-4-6 → claude-opus-4.6）
+    normalized_dot = re.sub(r'(\d)-(\d)', r'\1.\2', normalized)
 
-    if normalized in models:
-        return models[normalized]["internal_key"]
+    # 精确匹配（原始 + 点号版本）
+    for candidate in [normalized, normalized_dot]:
+        if candidate in models:
+            return models[candidate]["internal_key"]
 
-    # 增强版模式匹配：只要求对方名字包含核心关键词即可
+    # 前缀/包含匹配（点号版本优先）
+    for candidate in [normalized_dot, normalized]:
+        for mid, info in models.items():
+            if candidate in mid or mid in candidate:
+                logger.info(f"模型 '{model_id}' 模糊匹配到本地模型: {mid}")
+                return info["internal_key"]
+
+    # 品牌匹配兜底
     for mid, info in models.items():
         if "gemini" in normalized and "gemini" in info["label"].lower():
             return info["internal_key"]
         if "claude" in normalized and "claude" in info["label"].lower():
             return info["internal_key"]
-            
-    # 如果实在匹配不到对应的厂牌，尝试降级到最基本的模糊名称
-    for mid, info in models.items():
-        if normalized in mid or normalized in info["label"].lower():
-            return info["internal_key"]
-            
+
     # 默认第一个
     if models:
         first = next(iter(models.values()))
         logger.warning(f"模型 '{model_id}' 均未能精确匹配，随机使用默认存活: {first['label']}")
         return first["internal_key"]
-        
+
     raise ValueError(f"无法解析模型 '{model_id}'，Language Server 内部模型表均为空")
 
 
@@ -619,31 +686,26 @@ async def health():
 
 @app.get("/v1/models")
 async def list_models(request: Request):
-    if not _check_auth(request):
-        return JSONResponse({"error": {"message": "Unauthorized"}}, status_code=401)
+    # Removed auth check to allow Cursor to automatically fetch the models list without API keys
     try:
         models = await _fetch_models()
     except Exception as e:
         return JSONResponse({"error": {"message": str(e)}}, status_code=502)
-        
-    combined_data = [
-        {"id": mid, "object": "model", "created": 1700000000, "owned_by": "antigravity (local)"}
-        for mid in models
-    ]
-    
-    if EXTERNAL_ANTHROPIC_API_KEY and EXTERNAL_ANTHROPIC_BASE_URL:
-        try:
-            async with httpx.AsyncClient(timeout=4) as client:
-                r = await client.get(f"{EXTERNAL_ANTHROPIC_BASE_URL}/v1/models", headers={"Authorization": f"Bearer {EXTERNAL_ANTHROPIC_API_KEY}"})
-                if r.status_code == 200:
-                    ext_data = r.json().get("data", [])
-                    for m in ext_data:
-                        if not m.get("owned_by"): m["owned_by"] = "third-party proxy"
-                        # De-duplicate
-                        if not any(cd["id"] == m["id"] for cd in combined_data):
-                            combined_data.append(m)
-        except Exception as e:
-            logger.warning(f"获取第三方模型列表失败: {e}")
+
+    # 核心策略：给所有模型加上 ag- 前缀，让 Cursor 完全不认识它们，
+    # 从根本上绕过 Cursor 对内置模型名的客户端校验。
+    # 去重：只保留连字符版本（跳过带小数点的原始版本）
+    seen = set()
+    combined_data = []
+    for mid in models:
+        # 统一用连字符版本
+        display_id = re.sub(r'(\d+)\.(\d+)', r'\1-\2', mid)
+        ag_id = f"ag-{display_id}"
+        if ag_id not in seen:
+            seen.add(ag_id)
+            combined_data.append(
+                {"id": ag_id, "object": "model", "created": 1700000000, "owned_by": "antigravity-local"}
+            )
 
     return {
         "object": "list",
@@ -687,7 +749,26 @@ async def chat_completions(request: Request):
     except ValueError as e:
         return JSONResponse({"error": {"message": str(e)}}, status_code=400)
 
+    # 模型回退链：当主模型配额用尽时，自动尝试备选模型
+    _FALLBACK_CHAIN = {
+        "claude-opus-4-6-thinking":   ["gemini-3-1-pro-high", "gemini-3-flash"],
+        "claude-opus-4-6":            ["gemini-3-1-pro-high", "gemini-3-flash"],
+        "claude-opus-4.6":            ["gemini-3-1-pro-high", "gemini-3-flash"],
+        "claude-sonnet-4-6-thinking": ["gemini-3-1-pro-high", "gemini-3-flash"],
+        "claude-sonnet-4-6":          ["gemini-3-1-pro-low", "gemini-3-flash"],
+        "claude-sonnet-4.6":          ["gemini-3-1-pro-low", "gemini-3-flash"],
+        "gpt-oss-120b-medium":        ["gemini-3-1-pro-high", "gemini-3-flash"],
+        "antigravity-gpt-oss":        ["gemini-3-1-pro-high", "gemini-3-flash"],
+    }
+
     max_retries = 3
+    quota_exhausted = False
+    
+    # 规范化当前模型名小写，并去掉 ag- 前缀
+    normalized_model_id = model_id.lower().strip()
+    if normalized_model_id.startswith("ag-"):
+        normalized_model_id = normalized_model_id[3:]
+    
     for attempt in range(max_retries):
         try:
             # 构建 prompt (放到循环内以便支持动态重压缩机制)
@@ -700,21 +781,44 @@ async def chat_completions(request: Request):
         except RuntimeError as e:
             err_str = str(e)
             is_overload = "503" in err_str or "500" in err_str or "Timeout" in err_str or "connection" in err_str.lower()
+            is_quota = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
+            
+            if is_quota:
+                quota_exhausted = True
             
             if is_overload and attempt < max_retries - 1:
                 logger.warning(f"[{req_id}] 本地引擎限流或 500 故障 ({err_str}), 触发自动压缩重试 ({attempt+1}/{max_retries})...")
                 if len(messages) > 6:
                     sys_msgs = [m for m in messages if m.get("role") == "system"]
                     other_msgs = [m for m in messages if m.get("role") != "system"]
-                    # 每次重试抛弃最老的数条中间历史对话
                     keep = max(4, len(other_msgs) - (attempt + 2))
                     messages = sys_msgs + other_msgs[-keep:]
                     
                 await asyncio.sleep(2 + attempt * 2)
                 continue
                 
+            # ===== 模型回退机制：配额耗尽时自动切换到备选模型 =====
+            if quota_exhausted and normalized_model_id in _FALLBACK_CHAIN:
+                fallbacks = _FALLBACK_CHAIN[normalized_model_id]
+                for fb_alias in fallbacks:
+                    try:
+                        fb_internal = await _resolve_model(fb_alias)
+                        logger.info(f"[{req_id}] 🔄 主模型 {normalized_model_id} 配额耗尽，自动回退到备用模型: {fb_alias} ({fb_internal})")
+                        prompt = _build_prompt(messages, tools)
+                        result = await _call_ls("GetModelResponse", {"model": fb_internal, "prompt": prompt})
+                        logger.info(f"[{req_id}] ✅ 回退模型 {fb_alias} 响应成功")
+                        quota_exhausted = False  # 标记成功
+                        break
+                    except Exception as fb_e:
+                        logger.warning(f"[{req_id}] 回退模型 {fb_alias} 也失败: {fb_e}")
+                        continue
+                
+                if not quota_exhausted:
+                    break  # 回退成功，跳出主重试循环
+            # ===== END 回退 =====
+                
             logger.error(f"[{req_id}] language server 错误: {e}")
-            err_msg = f"\n\n🚨 [Antigravity Proxy 网关截获报错]\n本地底层引擎崩溃或拒绝服务: {e}\n\n💡 诊断：这通常是因为发过去的日志过长，导致本地后端组件段错误或处理超时（经过多次压缩后仍无法抢救）。\n建议：请在 Cursor 里新建聊天 (New Chat)，重新用短请求要求 AI '继续完成任务'！或者转外网大模型。"
+            err_msg = f"\n\n🚨 [Antigravity Proxy 网关截获报错]\n本地底层引擎崩溃或拒绝服务: {e}\n\n💡 诊断：这主要是因为当前所选模型的配额（Quota）已经被用尽了。\n代理工具尝试回退备用模型也遭到了失败。\n建议：去 Cursor Settings 里切换一下其它模型，如 gemini-3.1-pro-high。"
             if stream:
                 return StreamingResponse(
                     _stream_response(f"err-{uuid.uuid4().hex[:8]}", int(time.time()), model_id, err_msg, []),
