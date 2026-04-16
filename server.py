@@ -107,18 +107,43 @@ req_logger.propagate = False
 
 
 def jlog(req_id: str, direction: str, data):
-    if LOG_REQUESTS:
-        req_logger.info(json.dumps(
-            {"req_id": req_id, "ts": datetime.now().isoformat(), "dir": direction, "data": data},
-            ensure_ascii=False, default=str,
-        ))
+    """Lightweight logging: only record metadata by default, not full body."""
+    if not LOG_REQUESTS:
+        return
+    if not _LOG_FULL_BODY and isinstance(data, dict):
+        light_data = {}
+        for k, v in data.items():
+            if k in ("messages", "tools", "prompt"):
+                if isinstance(v, list):
+                    light_data[k] = f"[{len(v)} items]"
+                elif isinstance(v, str):
+                    light_data[k] = f"[{len(v)} chars]"
+                else:
+                    light_data[k] = f"[{type(v).__name__}]"
+            elif k in ("response", "preview"):
+                light_data[k] = str(v)[:200]
+            else:
+                light_data[k] = v
+        data = light_data
+    req_logger.info(json.dumps(
+        {"req_id": req_id, "ts": datetime.now().isoformat(), "dir": direction, "data": data},
+        ensure_ascii=False, default=str,
+    ))
 
-
-# ─────────────────────── Language Server 发现 ───────────────────────
+# ─────────────────────── Language Server 发现 (多实例) ───────────────
+# Each instance: {"pid": int, "port": int, "csrf": str, "has_lsp": bool, "verified_ts": float}
+_ls_instances: list[dict] = []
+_ls_rr_index: int = 0           # round-robin counter
+_ls_discover_ts: float = 0      # last full discovery timestamp
+_LS_DISCOVER_TTL: float = 60.0  # re-scan process table every 60s
+_LS_HEARTBEAT_TTL: float = 30.0
+# Legacy single-instance aliases (used by _call_ls for backward compat)
 _ls_port: Optional[int] = None
 _ls_csrf: Optional[str] = None
+_ls_verified_ts: float = 0
 _model_cache: dict = {}
 _model_cache_ts: float = 0
+_LOG_FULL_BODY: bool = os.environ.get("LOG_FULL_BODY", "false").lower() == "true"
 
 # 支持多种可能的进程名（Antigravity 更新后进程名可能改变）
 _LS_PROCESS_PATTERNS = [
@@ -142,64 +167,91 @@ def _match_ls_process(line: str) -> bool:
 
 
 async def _discover_ls() -> tuple[int, str]:
-    """扫描进程表，找到 Antigravity language server 的端口和 CSRF token。"""
-    global _ls_port, _ls_csrf
-    if _ls_port and _ls_csrf:
-        # 验证缓存的连接是否还活着
-        try:
-            async with httpx.AsyncClient() as client:
-                r = await client.post(
-                    f"http://127.0.0.1:{_ls_port}/exa.language_server_pb.LanguageServerService/Heartbeat",
-                    json={}, headers={
-                        "Content-Type": "application/json",
-                        "x-codeium-csrf-token": _ls_csrf,
-                        "Connect-Protocol-Version": "1",
-                    }, timeout=2,
-                )
-                if r.status_code == 200:
-                    return _ls_port, _ls_csrf
-        except Exception:
-            logger.warning("⚠️ 缓存的 Language Server 连接失效，重新发现...")
-            _reset_ls()
+    """Return one (port, csrf) for backward compat. Uses round-robin across all instances."""
+    inst = await _pick_ls()
+    return inst["port"], inst["csrf"]
+
+
+async def _discover_all_instances() -> list[dict]:
+    """Scan process table, find ALL usable LS instances. Prefer --enable_lsp."""
+    global _ls_instances, _ls_discover_ts, _ls_port, _ls_csrf, _ls_verified_ts
+
+    # TTL: don't re-scan too often
+    if _ls_instances and time.time() - _ls_discover_ts < _LS_DISCOVER_TTL:
+        return _ls_instances
 
     try:
         cmdline = await asyncio.to_thread(subprocess.check_output, ["ps", "aux"], text=True)
     except Exception as e:
-        raise RuntimeError(f"无法执行 ps aux 命令: {e}")
+        if _ls_instances:
+            return _ls_instances
+        raise RuntimeError(f"Cannot run ps aux: {e}")
 
     candidates = []
     for line in cmdline.splitlines():
         if not _match_ls_process(line):
             continue
-        # 支持 --csrf_token 和 --csrf-token 两种写法
         m = re.search(r"--csrf[_-]token\s+(\S+)", line)
         if not m:
             continue
         csrf = m.group(1)
         pid = int(line.split()[1])
-        candidates.append((pid, csrf, line.strip()[:120]))
+        has_lsp = "--enable_lsp" in line
+        candidates.append((pid, csrf, has_lsp))
 
-    for pid, csrf, line_preview in candidates:
+    # Only keep --enable_lsp instances if any exist
+    lsp_candidates = [c for c in candidates if c[2]]
+    if lsp_candidates:
+        candidates = lsp_candidates
+
+    new_instances = []
+    for pid, csrf, has_lsp in candidates:
+        # Check if we already have this pid+csrf cached
+        existing = next((i for i in _ls_instances if i["pid"] == pid and i["csrf"] == csrf), None)
+        if existing and time.time() - existing["verified_ts"] < _LS_HEARTBEAT_TTL:
+            new_instances.append(existing)
+            continue
         port = await _find_http_port(pid, csrf)
         if port:
-            _ls_port = port
-            _ls_csrf = csrf
-            logger.info(f"✅ 发现 language server: port={port} csrf={csrf[:8]}... (pid={pid})")
-            return port, csrf
+            tag = "lsp+credits" if has_lsp else "legacy"
+            logger.info(f"Found LS instance [{tag}]: port={port} pid={pid}")
+            new_instances.append({
+                "pid": pid, "port": port, "csrf": csrf,
+                "has_lsp": has_lsp, "verified_ts": time.time(),
+            })
 
-    # 诊断信息
-    diag_lines = [l.strip()[:100] for l in cmdline.splitlines() if "language" in l.lower() or "antigravity" in l.lower() or "codeium" in l.lower() or "csrf" in l.lower()]
-    diag_msg = "\n".join(diag_lines[:5]) if diag_lines else "(无相关进程)"
-    raise RuntimeError(
-        f"找不到 Antigravity language server 进程。\n"
-        f"请确认：1) Antigravity 正在运行  2) 你已登录会员账号\n"
-        f"搜索关键词: {_LS_PROCESS_PATTERNS}\n"
-        f"进程表相关行:\n{diag_msg}"
-    )
+    if new_instances:
+        _ls_instances = new_instances
+        _ls_discover_ts = time.time()
+        # Update legacy aliases to first instance
+        _ls_port = new_instances[0]["port"]
+        _ls_csrf = new_instances[0]["csrf"]
+        _ls_verified_ts = new_instances[0]["verified_ts"]
+        logger.info(f"LS pool: {len(new_instances)} instance(s) available")
+    elif not _ls_instances:
+        diag = [l.strip()[:100] for l in cmdline.splitlines()
+                if any(k in l.lower() for k in ("language", "antigravity", "csrf"))]
+        raise RuntimeError(
+            f"No Antigravity language server found.\n"
+            f"Relevant processes:\n" + "\n".join(diag[:5])
+        )
+
+    return _ls_instances
+
+
+async def _pick_ls() -> dict:
+    """Round-robin pick an instance from the pool."""
+    global _ls_rr_index
+    instances = await _discover_all_instances()
+    if not instances:
+        raise RuntimeError("No LS instances available")
+    idx = _ls_rr_index % len(instances)
+    _ls_rr_index = idx + 1
+    return instances[idx]
 
 
 def _get_pid_ports(pid: int) -> list[int]:
-    """获取指定 PID 的所有监听端口，优先使用 lsof 以避免 ss 输出截断。"""
+    """Get all listening ports for a PID."""
     ports = set()
     try:
         out = subprocess.check_output(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"], text=True)
@@ -212,7 +264,6 @@ def _get_pid_ports(pid: int) -> list[int]:
             return sorted(list(ports))
     except Exception:
         pass
-
     try:
         out = subprocess.check_output(["ss", "-tlnp"], text=True)
         out_flat = out.replace("\n", " ")
@@ -224,37 +275,57 @@ def _get_pid_ports(pid: int) -> list[int]:
 
 
 async def _find_http_port(pid: int, csrf: str) -> Optional[int]:
-    """尝试各端口，找到能响应 Heartbeat 的 HTTP 端口。"""
+    """Find the HTTP port that responds to Heartbeat for a given PID."""
     headers = {
         "Content-Type": "application/json",
         "x-codeium-csrf-token": csrf,
         "Connect-Protocol-Version": "1",
     }
     ports = await asyncio.to_thread(_get_pid_ports, pid)
-    async with httpx.AsyncClient() as client:
-        for port in ports:
-            try:
-                r = await client.post(
-                    f"http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/Heartbeat",
-                    json={}, headers=headers, timeout=2,
-                )
-                if r.status_code == 200:
-                    return port
-            except Exception:
-                continue
+    client = _http_client or httpx.AsyncClient()
+    for port in ports:
+        try:
+            r = await client.post(
+                f"http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/Heartbeat",
+                json={}, headers=headers, timeout=2,
+            )
+            if r.status_code == 200:
+                return port
+        except Exception:
+            continue
     return None
 
 
 def _reset_ls():
-    global _ls_port, _ls_csrf, _model_cache_ts
+    global _ls_port, _ls_csrf, _model_cache_ts, _ls_verified_ts, _ls_instances, _ls_discover_ts
     _ls_port = None
     _ls_csrf = None
     _model_cache_ts = 0
+    _ls_verified_ts = 0
+    _ls_instances = []
+    _ls_discover_ts = 0
 
 
-async def _call_ls(method: str, body: dict, timeout: float = 120) -> dict:
-    """向 language server 发起 RPC 调用。"""
-    port, csrf = await _discover_ls()
+def _remove_instance(port: int):
+    """Remove a dead instance from the pool."""
+    global _ls_instances
+    _ls_instances = [i for i in _ls_instances if i["port"] != port]
+    if not _ls_instances:
+        _reset_ls()
+    logger.warning(f"Removed dead LS instance port={port}, {len(_ls_instances)} remaining")
+
+
+async def _call_ls(method: str, body: dict, timeout: float = 120, _skip_discover: bool = False) -> dict:
+    """RPC call to language server with multi-instance load balancing."""
+    global _ls_rr_index
+    if _skip_discover and _ls_instances:
+        idx = _ls_rr_index % len(_ls_instances)
+        _ls_rr_index = idx + 1
+        inst = _ls_instances[idx]
+    else:
+        inst = await _pick_ls()
+
+    port, csrf = inst["port"], inst["csrf"]
     url = f"http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/{method}"
     headers = {
         "Content-Type": "application/json",
@@ -265,18 +336,25 @@ async def _call_ls(method: str, body: dict, timeout: float = 120) -> dict:
     try:
         r = await client.post(url, json=body, headers=headers, timeout=timeout)
     except httpx.ConnectError:
-        _reset_ls()
-        raise RuntimeError("Antigravity language server 连接断开，请检查 Antigravity 是否运行")
+        _remove_instance(port)
+        raise RuntimeError("Antigravity language server connection lost")
     except httpx.TimeoutException:
-        raise RuntimeError(f"Antigravity language server 处理超时 (Timeout: {timeout}s 当前上下文极长或引擎假死)")
+        raise RuntimeError(f"Antigravity language server timeout ({timeout}s)")
     except Exception as e:
-        raise RuntimeError(f"Antigravity language server 请求发生异常: {e}")
+        _remove_instance(port)
+        raise RuntimeError(f"Antigravity language server error: {e}")
 
     if r.status_code == 404:
-        raise RuntimeError(f"方法 {method} 不存在")
+        raise RuntimeError(f"Method {method} not found")
+    # Log non-200 responses for debugging
+    if r.status_code != 200:
+        body_preview = r.text[:300] if r.text else "(empty)"
+        logger.warning(f"LS port={port} method={method} HTTP {r.status_code}: {body_preview}")
+    # Successful call refreshes instance TTL
+    inst["verified_ts"] = time.time()
     data = r.json()
     if "code" in data and data["code"] != "ok":
-        raise RuntimeError(data.get("message", str(data)))
+        raise RuntimeError(f"HTTP {r.status_code}: {data.get('message', str(data))}")
     return data
 
 
@@ -285,18 +363,15 @@ def _label_to_id(label: str) -> str:
     return label.lower().replace(" ", "-").replace("(", "").replace(")", "").strip("-")
 
 async def _fetch_models() -> dict:
-    """动态从 language server 获取可用模型列表，缓存 60 秒。"""
+    """Fetch available models from language server, cached for 300s (was 60s)."""
     global _model_cache, _model_cache_ts
-    if time.time() - _model_cache_ts < 60 and _model_cache:
+    if time.time() - _model_cache_ts < 300 and _model_cache:
         return _model_cache
 
     models = {}
-    for rpc in ["GetCascadeModelConfigData", "GetCommandModelConfigs"]:
-        try:
-            data = await _call_ls(rpc, {})
-        except Exception as e:
-            logger.warning(f"获取模型列表失败 ({rpc}): {e}")
-            continue
+    # Only call GetCascadeModelConfigData; GetCommandModelConfigs always returns 501
+    try:
+        data = await _call_ls("GetCascadeModelConfigData", {}, _skip_discover=True)
         for cfg in data.get("clientModelConfigs", []):
             label = cfg.get("label", "")
             key = (
@@ -309,21 +384,23 @@ async def _fetch_models() -> dict:
             model_id = _label_to_id(label)
             if model_id not in models:
                 models[model_id] = {"internal_key": key, "label": label}
+    except Exception as e:
+        logger.warning(f"Failed to fetch models: {e}")
+        if _model_cache:
+            return _model_cache  # Return stale cache on error
 
-    # 额外的别名方便用户使用
     _ALIAS = {
-        "claude-opus-4.6":           "claude-opus-4.6-thinking",
-        "claude-sonnet-4.6":         "claude-sonnet-4.6-thinking",
-        "antigravity-gemini-flash":  "gemini-3-flash",
-        "antigravity-gemini-pro":    "gemini-3.1-pro-low",
+        "claude-opus-4.6":             "claude-opus-4.6-thinking",
+        "claude-sonnet-4.6":           "claude-sonnet-4.6-thinking",
+        "antigravity-gemini-flash":    "gemini-3-flash",
+        "antigravity-gemini-pro":      "gemini-3.1-pro-low",
         "antigravity-gemini-pro-high": "gemini-3.1-pro-high",
-        "antigravity-gpt-oss":       "gpt-oss-120b-medium",
+        "antigravity-gpt-oss":         "gpt-oss-120b-medium",
     }
     for alias, target in _ALIAS.items():
         if target in models and alias not in models:
             models[alias] = models[target]
 
-    # 自动生成连字符版别名（Cursor 不喜欢小数点，如 gemini-3.1 → gemini-3-1）
     dot_models = {mid: info for mid, info in list(models.items()) if "." in mid}
     for mid, info in dot_models.items():
         hyphen_version = re.sub(r'(\d+)\.(\d+)', r'\1-\2', mid)
@@ -560,7 +637,7 @@ async def lifespan(app: FastAPI):
     yield
     await _http_client.aclose()
 
-app = FastAPI(title="Antigravity Proxy", version="5.0.0", lifespan=lifespan)
+app = FastAPI(title="Antigravity Proxy", version="5.2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -678,8 +755,12 @@ async def discover_models(request: Request):
 @app.get("/health")
 async def health():
     try:
-        port, _ = await _discover_ls()
-        return {"status": "ok", "ls_port": port}
+        instances = await _discover_all_instances()
+        return {
+            "status": "ok",
+            "ls_instances": len(instances),
+            "pool": [{"port": i["port"], "pid": i["pid"], "has_lsp": i["has_lsp"]} for i in instances],
+        }
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=503)
 
@@ -743,112 +824,86 @@ async def chat_completions(request: Request):
         return await _forward_openai_to_external_openai(req_id, body, stream)
     # =========================================================================
 
-    # 解析模型
+    # Resolve model key
     try:
         internal_key = await _resolve_model(model_id)
     except ValueError as e:
         return JSONResponse({"error": {"message": str(e)}}, status_code=400)
 
-    # 模型回退链：当主模型配额用尽时，自动尝试备选模型
     _FALLBACK_CHAIN = {
         "claude-opus-4-6-thinking":   ["gemini-3-1-pro-high", "gemini-3-flash"],
         "claude-opus-4-6":            ["gemini-3-1-pro-high", "gemini-3-flash"],
         "claude-opus-4.6":            ["gemini-3-1-pro-high", "gemini-3-flash"],
         "claude-sonnet-4-6-thinking": ["gemini-3-1-pro-high", "gemini-3-flash"],
-        "claude-sonnet-4-6":          ["gemini-3-1-pro-low", "gemini-3-flash"],
-        "claude-sonnet-4.6":          ["gemini-3-1-pro-low", "gemini-3-flash"],
+        "claude-sonnet-4-6":          ["gemini-3-1-pro-low",  "gemini-3-flash"],
+        "claude-sonnet-4.6":          ["gemini-3-1-pro-low",  "gemini-3-flash"],
         "gpt-oss-120b-medium":        ["gemini-3-1-pro-high", "gemini-3-flash"],
         "antigravity-gpt-oss":        ["gemini-3-1-pro-high", "gemini-3-flash"],
     }
 
-    max_retries = 3
-    quota_exhausted = False
-    
-    # 规范化当前模型名小写，并去掉 ag- 前缀
     normalized_model_id = model_id.lower().strip()
     if normalized_model_id.startswith("ag-"):
         normalized_model_id = normalized_model_id[3:]
-    
-    for attempt in range(max_retries):
-        try:
-            # 构建 prompt (放到循环内以便支持动态重压缩机制)
-            prompt = _build_prompt(messages, tools)
-            if attempt == 0:
-                jlog(req_id, "proxy→ls", {"model": internal_key, "prompt_chars": len(prompt)})
-                
-            result = await _call_ls("GetModelResponse", {"model": internal_key, "prompt": prompt})
-            break
-        except RuntimeError as e:
-            err_str = str(e)
-            is_overload = "503" in err_str or "500" in err_str or "Timeout" in err_str or "connection" in err_str.lower()
-            is_quota = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
-            
-            if is_quota:
-                quota_exhausted = True
-            
-            if is_overload and attempt < max_retries - 1:
-                logger.warning(f"[{req_id}] 本地引擎限流或 500 故障 ({err_str}), 触发自动压缩重试 ({attempt+1}/{max_retries})...")
-                if len(messages) > 6:
-                    sys_msgs = [m for m in messages if m.get("role") == "system"]
-                    other_msgs = [m for m in messages if m.get("role") != "system"]
-                    keep = max(4, len(other_msgs) - (attempt + 2))
-                    messages = sys_msgs + other_msgs[-keep:]
-                    
-                await asyncio.sleep(2 + attempt * 2)
-                continue
-                
-            # ===== 模型回退机制：配额耗尽时自动切换到备选模型 =====
-            if quota_exhausted and normalized_model_id in _FALLBACK_CHAIN:
-                fallbacks = _FALLBACK_CHAIN[normalized_model_id]
-                for fb_alias in fallbacks:
-                    try:
-                        fb_internal = await _resolve_model(fb_alias)
-                        logger.info(f"[{req_id}] 🔄 主模型 {normalized_model_id} 配额耗尽，自动回退到备用模型: {fb_alias} ({fb_internal})")
-                        prompt = _build_prompt(messages, tools)
-                        result = await _call_ls("GetModelResponse", {"model": fb_internal, "prompt": prompt})
-                        logger.info(f"[{req_id}] ✅ 回退模型 {fb_alias} 响应成功")
-                        quota_exhausted = False  # 标记成功
-                        break
-                    except Exception as fb_e:
-                        logger.warning(f"[{req_id}] 回退模型 {fb_alias} 也失败: {fb_e}")
-                        continue
-                
-                if not quota_exhausted:
-                    break  # 回退成功，跳出主重试循环
-            # ===== END 回退 =====
-                
-            logger.error(f"[{req_id}] language server 错误: {e}")
-            err_msg = f"\n\n🚨 [Antigravity Proxy 网关截获报错]\n本地底层引擎崩溃或拒绝服务: {e}\n\n💡 诊断：这主要是因为当前所选模型的配额（Quota）已经被用尽了。\n代理工具尝试回退备用模型也遭到了失败。\n建议：去 Cursor Settings 里切换一下其它模型，如 gemini-3.1-pro-high。"
-            if stream:
-                return StreamingResponse(
-                    _stream_response(f"err-{uuid.uuid4().hex[:8]}", int(time.time()), model_id, err_msg, []),
-                    media_type="text/event-stream"
-                )
-            return JSONResponse({"error": {"message": str(e)}}, status_code=502)
-
-    raw_text = result.get("response", "")
-    jlog(req_id, "ls→proxy", {"response_chars": len(raw_text), "preview": raw_text[:200]})
-
-    # 解析工具调用
-    content, tool_calls = _parse_tool_calls(raw_text)
-    finish_reason = "tool_calls" if tool_calls else "stop"
-
-    logger.info(
-        f"[{req_id}] ✓ finish={finish_reason} "
-        f"tool_calls={len(tool_calls)} content_len={len(content or '')}"
-    )
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
+    # --- STREAM PATH: Return immediately so Cursor sees "generating" state ---
     if stream:
         return StreamingResponse(
-            _stream_response(completion_id, created, model_id, content, tool_calls),
+            _stream_with_thinking(req_id, completion_id, created, model_id,
+                                  messages, tools, internal_key,
+                                  normalized_model_id, _FALLBACK_CHAIN),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # 构建 assistant message
+    # --- NON-STREAM PATH ---
+    # Fast-path: Cursor probes each model with single short message. Return instant response.
+    is_probe = (len(messages) <= 1 and len(tools) == 0 and
+                all(len(m.get("content", "")) < 100 for m in messages))
+    if not stream and is_probe:
+        probe_content = messages[0].get("content", "") if messages else ""
+        logger.info(f"[{req_id}] fast-probe response for model probe")
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model_id,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    prompt = _build_prompt(messages, tools)
+    jlog(req_id, "proxy->ls", {"model": internal_key, "prompt_chars": len(prompt)})
+    result = None
+    for attempt in range(3):
+        try:
+            result = await _call_ls("GetModelResponse", {"model": internal_key, "prompt": prompt},
+                                    _skip_discover=True)
+            break
+        except RuntimeError as e:
+            err_str = str(e)
+            is_quota = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
+            is_overload = ("500" in err_str or "503" in err_str or
+                           "timeout" in err_str.lower() or "RESOURCE_EXHAUSTED" in err_str or
+                           "EOF" in err_str)
+            if is_overload and attempt < 2:
+                await asyncio.sleep(1 + attempt)
+                continue
+            logger.error(f"[{req_id}] LS error: {e}")
+            return JSONResponse({"error": {"message": str(e)}}, status_code=502)
+
+    if not result:
+        return JSONResponse({"error": {"message": "All models unavailable"}}, status_code=502)
+
+    raw_text = result.get("response", "")
+    jlog(req_id, "ls->proxy", {"response_chars": len(raw_text), "preview": raw_text[:200]})
+    content, tool_calls = _parse_tool_calls(raw_text)
+    finish_reason = "tool_calls" if tool_calls else "stop"
+    logger.info(f"[{req_id}] done finish={finish_reason} tool_calls={len(tool_calls)} "
+                f"content_len={len(content or '')}")
+
     message: dict = {"role": "assistant", "content": content}
     if tool_calls:
         message["tool_calls"] = tool_calls
@@ -858,17 +913,168 @@ async def chat_completions(request: Request):
         "object": "chat.completion",
         "created": created,
         "model": model_id,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish_reason,
-        }],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         "usage": {
             "prompt_tokens": len(prompt.split()),
             "completion_tokens": len(raw_text.split()),
             "total_tokens": len(prompt.split()) + len(raw_text.split()),
         },
     }
+
+
+async def _parallel_fallback(req_id: str, messages: list, tools: list,
+                              fallback_aliases: list) -> Optional[dict]:
+    """Concurrently try all fallback models; return first successful result."""
+    prompt = _build_prompt(messages, tools)
+
+    async def _try(alias: str) -> Optional[dict]:
+        try:
+            fb_key = await _resolve_model(alias)
+            logger.info(f"[{req_id}] fallback attempt: {alias}")
+            r = await _call_ls("GetModelResponse", {"model": fb_key, "prompt": prompt},
+                               _skip_discover=True)
+            logger.info(f"[{req_id}] fallback OK: {alias}")
+            return r
+        except Exception as fe:
+            logger.warning(f"[{req_id}] fallback failed {alias}: {fe}")
+            return None
+
+    tasks = [asyncio.create_task(_try(a)) for a in fallback_aliases]
+    for coro in asyncio.as_completed(tasks):
+        r = await coro
+        if r is not None:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            return r
+    return None
+
+
+async def _stream_with_thinking(
+    req_id: str,
+    completion_id: str,
+    created: int,
+    model_id: str,
+    messages: list,
+    tools: list,
+    internal_key: str,
+    normalized_model_id: str,
+    fallback_chain: dict,
+):
+    """
+    Streaming generator: immediately sends role marker so Cursor shows
+    "generating" instead of a blank wait. Model inference runs in the
+    background; result is then chunked and streamed out.
+    """
+    def _chunk(delta: dict, finish_reason=None) -> str:
+        return "data: " + json.dumps({
+            "id": completion_id, "object": "chat.completion.chunk",
+            "created": created, "model": model_id,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }, ensure_ascii=False) + "\n\n"
+
+    # Immediately acknowledge so Cursor leaves "queued" state
+    yield _chunk({"role": "assistant"})
+    await asyncio.sleep(0)
+
+    prompt = _build_prompt(messages, tools)
+    jlog(req_id, "proxy->ls", {"model": internal_key, "prompt_chars": len(prompt)})
+
+    result = None
+    max_retries = 30  # max retries for overload (~60s with 2s sleep)
+    for attempt in range(max_retries):
+        try:
+            # Run model call as background task, send keep-alive while waiting
+            model_task = asyncio.create_task(
+                _call_ls("GetModelResponse", {"model": internal_key, "prompt": prompt},
+                         _skip_discover=True)
+            )
+            while not model_task.done():
+                await asyncio.sleep(2)
+                if not model_task.done():
+                    yield ": keepalive\n\n"
+            # await the task to properly propagate exceptions
+            result = await model_task
+            break
+        except RuntimeError as e:
+            err_str = str(e)
+
+            # Parse quota reset time from error message
+            import re as _re
+            reset_match = _re.search(r'reset after (\d+h)?(\d+m)?(\d+s)?', err_str)
+            reset_seconds = 0
+            if reset_match:
+                h = int(reset_match.group(1)[:-1]) if reset_match.group(1) else 0
+                m = int(reset_match.group(2)[:-1]) if reset_match.group(2) else 0
+                s = int(reset_match.group(3)[:-1]) if reset_match.group(3) else 0
+                reset_seconds = h * 3600 + m * 60 + s
+
+            is_resource_exhausted = "RESOURCE_EXHAUSTED" in err_str
+            is_transient = ("500" in err_str or "503" in err_str or
+                            "timeout" in err_str.lower() or "EOF" in err_str)
+
+            if is_resource_exhausted:
+                # Always retry same model - quota resets periodically
+                wait = min(10 + attempt * 5, 30) if reset_seconds > 60 else min(2 + attempt, 8)
+                logger.info(f"[{req_id}] quota limited (resets in {reset_seconds}s), retry in {wait}s (attempt {attempt+1}/{max_retries})...")
+                yield ": keepalive retry\n\n"
+                await asyncio.sleep(wait)
+                continue
+
+            if is_transient:
+                wait = min(2 + attempt, 8)
+                logger.info(f"[{req_id}] transient error, retry in {wait}s (attempt {attempt+1}/{max_retries})...")
+                yield ": keepalive retry\n\n"
+                await asyncio.sleep(wait)
+                continue
+
+            # Unknown error - still retry a few times
+            if attempt < 3:
+                logger.warning(f"[{req_id}] unknown error: {e}, retry (attempt {attempt+1})...")
+                yield ": keepalive retry\n\n"
+                await asyncio.sleep(3)
+                continue
+
+            # After 3 retries on unknown error, report to user
+            logger.error(f"[{req_id}] LS error after retries: {e}")
+            yield _chunk({"content": f"\n\nError: {e}\n\nPlease try again."})
+            yield _chunk({}, finish_reason="stop")
+            yield "data: [DONE]\n\n"
+            return
+
+    if not result:
+        yield _chunk({"content": "\n\nServer still busy after max retries. Please try again."})
+        yield _chunk({}, finish_reason="stop")
+        yield "data: [DONE]\n\n"
+        return
+
+    raw_text = result.get("response", "")
+    jlog(req_id, "ls->proxy", {"response_chars": len(raw_text), "preview": raw_text[:200]})
+    content, tool_calls = _parse_tool_calls(raw_text)
+    finish_reason = "tool_calls" if tool_calls else "stop"
+    logger.info(f"[{req_id}] done finish={finish_reason} tool_calls={len(tool_calls)} "
+                f"content_len={len(content or '')}")
+
+    if tool_calls:
+        if content:
+            yield _chunk({"content": content})
+            await asyncio.sleep(0)
+        for i, tc in enumerate(tool_calls):
+            yield _chunk({"tool_calls": [{
+                "index": i, "id": tc["id"], "type": "function",
+                "function": {"name": tc["function"]["name"], "arguments": ""},
+            }]})
+            yield _chunk({"tool_calls": [{"index": i, "function": {"arguments": tc["function"]["arguments"]}}]})
+        yield _chunk({}, finish_reason="tool_calls")
+    else:
+        text = content or ""
+        # Chunk by 50 chars for smooth streaming
+        for i in range(0, len(text), 50):
+            yield _chunk({"content": text[i:i + 50]})
+            await asyncio.sleep(0)
+        yield _chunk({}, finish_reason="stop")
+
+    yield "data: [DONE]\n\n"
 
 
 async def _stream_response(
@@ -878,51 +1084,34 @@ async def _stream_response(
     content: Optional[str],
     tool_calls: list[dict],
 ):
-    """生成符合 OpenAI 规范的 SSE 流，正确处理 tool_calls。"""
+    """Simple SSE stream for pre-built content (used for error messages)."""
 
     def _chunk(delta: dict, finish_reason=None) -> str:
         return "data: " + json.dumps({
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model_id,
+            "id": completion_id, "object": "chat.completion.chunk",
+            "created": created, "model": model_id,
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         }, ensure_ascii=False) + "\n\n"
 
-    # 开始标记
     yield _chunk({"role": "assistant"})
 
     if tool_calls:
-        # 先发 content（如果有）
         if content:
             yield _chunk({"content": content})
-
-        # 逐个发送 tool_calls
         for i, tc in enumerate(tool_calls):
-            # 第一个 chunk：初始化 tool_call
             yield _chunk({"tool_calls": [{
-                "index": i,
-                "id": tc["id"],
-                "type": "function",
+                "index": i, "id": tc["id"], "type": "function",
                 "function": {"name": tc["function"]["name"], "arguments": ""},
             }]})
-            # 发送 arguments
-            yield _chunk({"tool_calls": [{
-                "index": i,
-                "function": {"arguments": tc["function"]["arguments"]},
-            }]})
-
+            yield _chunk({"tool_calls": [{"index": i, "function": {"arguments": tc["function"]["arguments"]}}]})
         yield _chunk({}, finish_reason="tool_calls")
     else:
-        # 普通文字流式输出（按词分块）
         words = (content or "").split(" ")
-        chunk_size = 6
-        for i in range(0, len(words), chunk_size):
-            fragment = " ".join(words[i:i + chunk_size])
+        for i in range(0, len(words), 6):
+            fragment = " ".join(words[i:i + 6])
             if i > 0:
                 fragment = " " + fragment
             yield _chunk({"content": fragment})
-
         yield _chunk({}, finish_reason="stop")
 
     yield "data: [DONE]\n\n"
@@ -1324,7 +1513,7 @@ async def messages_endpoint(request: Request):
 
 
 if __name__ == "__main__":
-    print(f"\n🚀 Antigravity Proxy v5.0  →  http://localhost:{PROXY_PORT}")
+    print(f"\n🚀 Antigravity Proxy v5.1  →  http://localhost:{PROXY_PORT}")
     print(f"   Cursor 配置 : Base URL = http://localhost:{PROXY_PORT}/v1")
     print(f"   API Key     : {PROXY_API_KEY}")
     print(f"   日志目录    : {LOG_DIR.resolve()}/")
