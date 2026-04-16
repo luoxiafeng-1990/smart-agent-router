@@ -145,6 +145,9 @@ _model_cache: dict = {}
 _model_cache_ts: float = 0
 _LOG_FULL_BODY: bool = os.environ.get("LOG_FULL_BODY", "false").lower() == "true"
 
+
+
+
 # 支持多种可能的进程名（Antigravity 更新后进程名可能改变）
 _LS_PROCESS_PATTERNS = [
     "language_server_linux_x64",
@@ -316,8 +319,8 @@ def _remove_instance(port: int):
 
 
 async def _call_ls(method: str, body: dict, timeout: float = 120, _skip_discover: bool = False) -> dict:
-    """RPC call to language server with multi-instance load balancing."""
-    global _ls_rr_index
+    """RPC call to language server with multi-instance load balancing + 并发控制(方案3)."""
+    global _ls_rr_index, _ls_queue_depth
     if _skip_discover and _ls_instances:
         idx = _ls_rr_index % len(_ls_instances)
         _ls_rr_index = idx + 1
@@ -333,8 +336,14 @@ async def _call_ls(method: str, body: dict, timeout: float = 120, _skip_discover
         "Connect-Protocol-Version": "1",
     }
     client = _http_client or httpx.AsyncClient()
+
+    sem = _get_ls_semaphore()
+    _ls_queue_depth += 1
+    if _ls_queue_depth > _LS_MAX_CONCURRENT:
+        logger.info(f"LS backpressure: {_ls_queue_depth} requests queued (limit={_LS_MAX_CONCURRENT})")
     try:
-        r = await client.post(url, json=body, headers=headers, timeout=timeout)
+        async with sem:
+            r = await client.post(url, json=body, headers=headers, timeout=timeout)
     except httpx.ConnectError:
         _remove_instance(port)
         raise RuntimeError("Antigravity language server connection lost")
@@ -343,18 +352,19 @@ async def _call_ls(method: str, body: dict, timeout: float = 120, _skip_discover
     except Exception as e:
         _remove_instance(port)
         raise RuntimeError(f"Antigravity language server error: {e}")
+    finally:
+        _ls_queue_depth -= 1
 
     if r.status_code == 404:
         raise RuntimeError(f"Method {method} not found")
-    # Log non-200 responses for debugging
     if r.status_code != 200:
         body_preview = r.text[:300] if r.text else "(empty)"
         logger.warning(f"LS port={port} method={method} HTTP {r.status_code}: {body_preview}")
-    # Successful call refreshes instance TTL
     inst["verified_ts"] = time.time()
     data = r.json()
     if "code" in data and data["code"] != "ok":
-        raise RuntimeError(f"HTTP {r.status_code}: {data.get('message', str(data))}")
+        err_msg = data.get("message", str(data))
+        raise RuntimeError(f"HTTP {r.status_code}: {err_msg}")
     return data
 
 
@@ -399,7 +409,8 @@ async def _call_ls_pinned(inst: dict, method: str, body: dict, timeout: float = 
     inst["verified_ts"] = time.time()
     data = r.json()
     if "code" in data and data["code"] != "ok":
-        raise RuntimeError(f"HTTP {r.status_code}: {data.get('message', str(data))}")
+        err_msg = data.get("message", str(data))
+        raise RuntimeError(f"HTTP {r.status_code}: {err_msg}")
     return data
 
 
@@ -830,10 +841,43 @@ def _parse_tool_calls(text: str) -> tuple[Optional[str], list[dict]]:
 # ───────────────────────────── FastAPI App ──────────────────────────
 _http_client: Optional[httpx.AsyncClient] = None
 
+# ─── 方案3: 并发限制 + 请求队列背压 ───
+_LS_MAX_CONCURRENT = int(os.environ.get("LS_MAX_CONCURRENT", "3"))
+_ls_semaphore: Optional[asyncio.Semaphore] = None
+_ls_queue_depth: int = 0  # 当前排队数
+
+def _get_ls_semaphore() -> asyncio.Semaphore:
+    global _ls_semaphore
+    if _ls_semaphore is None:
+        _ls_semaphore = asyncio.Semaphore(_LS_MAX_CONCURRENT)
+    return _ls_semaphore
+
+
+def _backoff_with_jitter(attempt: int, base: float = 1.0, cap: float = 15.0) -> float:
+    """方案5: 指数退避 + 随机抖动，避免多请求同时重试造成雷群效应"""
+    import random
+    delay = min(base * (2 ** attempt), cap)
+    jitter = random.uniform(0, delay * 0.5)
+    return delay + jitter
+
+
+
+
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _http_client
+    global _http_client, _ls_semaphore
     _http_client = httpx.AsyncClient(timeout=120, limits=httpx.Limits(max_keepalive_connections=100))
+    _ls_semaphore = asyncio.Semaphore(_LS_MAX_CONCURRENT)
+    logger.info(f"LS concurrency limit: {_LS_MAX_CONCURRENT} (set LS_MAX_CONCURRENT to change)")
+    # Pre-probe quotas so first requests don't waste time on 429s
+    try:
+        await _discover_all_instances()
+        if not _ls_instances:
+            logger.warning("No LS instances found at startup")
+    except Exception as e:
+        logger.warning(f"Startup probe failed (non-fatal): {e}")
     yield
     await _http_client.aclose()
 
@@ -965,6 +1009,26 @@ async def health():
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=503)
 
 
+@app.get("/api/queue-status")
+async def queue_status():
+    """实时查看并发、队列和配额状态"""
+    sem = _get_ls_semaphore()
+    return {
+        "max_concurrent": _LS_MAX_CONCURRENT,
+        "active_requests": _LS_MAX_CONCURRENT - sem._value,
+        "queued": max(0, _ls_queue_depth - _LS_MAX_CONCURRENT),
+        "total_pending": _ls_queue_depth,
+        "ls_instances": len(_ls_instances),
+    }
+
+
+@app.get("/v1")
+@app.get("/v1/")
+async def v1_root():
+    """Cursor 验证 API Key 时会先 GET /v1，必须返回 200"""
+    return {"status": "ok", "message": "Smart Agent Router"}
+
+
 @app.get("/v1/models")
 async def list_models(request: Request):
     # Removed auth check to allow Cursor to automatically fetch the models list without API keys
@@ -1030,17 +1094,6 @@ async def chat_completions(request: Request):
     except ValueError as e:
         return JSONResponse({"error": {"message": str(e)}}, status_code=400)
 
-    _FALLBACK_CHAIN = {
-        "claude-opus-4-6-thinking":   ["gemini-3-1-pro-high", "gemini-3-flash"],
-        "claude-opus-4-6":            ["gemini-3-1-pro-high", "gemini-3-flash"],
-        "claude-opus-4.6":            ["gemini-3-1-pro-high", "gemini-3-flash"],
-        "claude-sonnet-4-6-thinking": ["gemini-3-1-pro-high", "gemini-3-flash"],
-        "claude-sonnet-4-6":          ["gemini-3-1-pro-low",  "gemini-3-flash"],
-        "claude-sonnet-4.6":          ["gemini-3-1-pro-low",  "gemini-3-flash"],
-        "gpt-oss-120b-medium":        ["gemini-3-1-pro-high", "gemini-3-flash"],
-        "antigravity-gpt-oss":        ["gemini-3-1-pro-high", "gemini-3-flash"],
-    }
-
     normalized_model_id = model_id.lower().strip()
     if normalized_model_id.startswith("ag-"):
         normalized_model_id = normalized_model_id[3:]
@@ -1053,7 +1106,7 @@ async def chat_completions(request: Request):
         return StreamingResponse(
             _stream_with_thinking(req_id, completion_id, created, model_id,
                                   messages, tools, internal_key,
-                                  normalized_model_id, _FALLBACK_CHAIN),
+                                  normalized_model_id),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -1078,9 +1131,8 @@ async def chat_completions(request: Request):
     jlog(req_id, "proxy->ls", {"model": internal_key, "prompt_chars": len(prompt)})
     result = None
 
-    # --- Strategy 1: 先用免费配额 (GetModelResponse) ---
-    quota_exhausted = False
-    for attempt in range(3):
+    # --- Step 1: 正常请求用户指定的模型（免费配额） ---
+    for attempt in range(2):
         try:
             result = await _call_ls("GetModelResponse", {"model": internal_key, "prompt": prompt},
                                     _skip_discover=True)
@@ -1088,39 +1140,30 @@ async def chat_completions(request: Request):
         except RuntimeError as e:
             err_str = str(e)
             if "RESOURCE_EXHAUSTED" in err_str:
-                logger.info(f"[{req_id}] non-stream: quota exhausted, will try Cascade credits")
-                quota_exhausted = True
+                # --- Step 2: 免费配额耗尽 → 用 Cascade API（AI积分）请求同一个模型 ---
+                if internal_key in _CASCADE_MODEL_MAP:
+                    logger.info(f"[{req_id}] non-stream: 免费配额用完 → 用 AI 积分请求同一模型 {internal_key}")
+                    try:
+                        result = await _call_cascade(internal_key, prompt, req_id=req_id, timeout=120)
+                        logger.info(f"[{req_id}] non-stream: ✅ Cascade API 成功（消耗积分）")
+                    except Exception as ce:
+                        logger.error(f"[{req_id}] non-stream: Cascade 也失败了: {ce}")
+                        return JSONResponse({"error": {"message": f"模型配额已用完，积分也无法使用: {ce}"}}, status_code=429)
+                else:
+                    return JSONResponse({"error": {"message": f"模型 {model_id} 配额已用完，且不支持积分付费"}}, status_code=429)
                 break
             is_overload = ("500" in err_str or "503" in err_str or
                            "timeout" in err_str.lower() or "EOF" in err_str)
-            if is_overload and attempt < 2:
-                await asyncio.sleep(1 + attempt)
+            if is_overload and attempt < 1:
+                wait = _backoff_with_jitter(attempt, base=1.0, cap=5.0)
+                logger.info(f"[{req_id}] non-stream transient error, retry in {wait:.1f}s")
+                await asyncio.sleep(wait)
                 continue
             logger.error(f"[{req_id}] LS error: {e}")
             return JSONResponse({"error": {"message": str(e)}}, status_code=502)
 
-    # --- Strategy 2: 配额耗尽 → 先试 fallback 模型（干净补全 API） ---
-    if result is None and quota_exhausted:
-        fb_aliases = _FALLBACK_CHAIN.get(normalized_model_id, [])
-        if fb_aliases:
-            logger.info(f"[{req_id}] non-stream: trying fallback models: {fb_aliases}")
-            fb_result = await _parallel_fallback(req_id, messages, tools, fb_aliases)
-            if fb_result:
-                result = fb_result
-                logger.info(f"[{req_id}] non-stream: ✅ fallback model success")
-
-    # --- Strategy 3: fallback 全失败 → 最后走 Cascade（用积分，但可能丢用户请求） ---
-    if result is None and quota_exhausted and internal_key in _CASCADE_MODEL_MAP:
-        try:
-            logger.info(f"[{req_id}] non-stream: fallbacks failed, last resort: Cascade API (credits)...")
-            result = await _call_cascade(internal_key, prompt, req_id=req_id, timeout=120)
-            logger.info(f"[{req_id}] non-stream: ✅ Cascade API success (used credits)")
-        except Exception as e:
-            logger.error(f"[{req_id}] non-stream: Cascade also failed: {e}")
-            return JSONResponse({"error": {"message": f"Quota exhausted and all fallbacks failed: {e}"}}, status_code=502)
-
     if not result:
-        return JSONResponse({"error": {"message": "All models unavailable"}}, status_code=502)
+        return JSONResponse({"error": {"message": "模型不可用"}}, status_code=502)
 
     raw_text = result.get("response", "")
     jlog(req_id, "ls->proxy", {"response_chars": len(raw_text), "preview": raw_text[:200]})
@@ -1159,34 +1202,6 @@ async def chat_completions(request: Request):
     }
 
 
-async def _parallel_fallback(req_id: str, messages: list, tools: list,
-                              fallback_aliases: list) -> Optional[dict]:
-    """Concurrently try all fallback models; return first successful result."""
-    prompt = _build_prompt(messages, tools)
-
-    async def _try(alias: str) -> Optional[dict]:
-        try:
-            fb_key = await _resolve_model(alias)
-            logger.info(f"[{req_id}] fallback attempt: {alias}")
-            r = await _call_ls("GetModelResponse", {"model": fb_key, "prompt": prompt},
-                               _skip_discover=True)
-            logger.info(f"[{req_id}] fallback OK: {alias}")
-            return r
-        except Exception as fe:
-            logger.warning(f"[{req_id}] fallback failed {alias}: {fe}")
-            return None
-
-    tasks = [asyncio.create_task(_try(a)) for a in fallback_aliases]
-    for coro in asyncio.as_completed(tasks):
-        r = await coro
-        if r is not None:
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-            return r
-    return None
-
-
 async def _stream_with_thinking(
     req_id: str,
     completion_id: str,
@@ -1196,12 +1211,13 @@ async def _stream_with_thinking(
     tools: list,
     internal_key: str,
     normalized_model_id: str,
-    fallback_chain: dict,
 ):
     """
     Streaming generator: immediately sends role marker so Cursor shows
     "generating" instead of a blank wait. Model inference runs in the
     background; result is then chunked and streamed out.
+    
+    429 (RESOURCE_EXHAUSTED) → 直接用 Cascade API (AI积分) 请求同一模型，不 fallback 到其他模型。
     """
     def _chunk(delta: dict, finish_reason=None) -> str:
         return "data: " + json.dumps({
@@ -1210,7 +1226,7 @@ async def _stream_with_thinking(
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         }, ensure_ascii=False) + "\n\n"
 
-    # Immediately acknowledge so Cursor leaves "queued" state
+    # 方案1: 立即发送 role 标记，Cursor 从 "queued" 进入 "generating" 状态
     yield _chunk({"role": "assistant"})
     await asyncio.sleep(0)
 
@@ -1218,19 +1234,25 @@ async def _stream_with_thinking(
     jlog(req_id, "proxy->ls", {"model": internal_key, "prompt_chars": len(prompt)})
 
     result = None
+    # 方案4: keepalive 间隔从 2s 降至 0.5s，让 Cursor 始终维持连接
+    _KEEPALIVE_INTERVAL = 0.5
 
-    # --- Strategy 1: 先用免费配额 (GetModelResponse) ---
-    max_retries = 10
-    for attempt in range(max_retries):
+    async def _wait_task_with_keepalive(task: asyncio.Task):
+        """等待异步任务完成，期间每 _KEEPALIVE_INTERVAL 发送心跳"""
+        while not task.done():
+            await asyncio.sleep(_KEEPALIVE_INTERVAL)
+            if not task.done():
+                yield ": keepalive\n\n"
+
+    # --- Step 1: 正常请求用户指定的模型（免费配额） ---
+    for attempt in range(2):
         try:
             model_task = asyncio.create_task(
                 _call_ls("GetModelResponse", {"model": internal_key, "prompt": prompt},
                          _skip_discover=True)
             )
-            while not model_task.done():
-                await asyncio.sleep(2)
-                if not model_task.done():
-                    yield ": keepalive\n\n"
+            async for ka in _wait_task_with_keepalive(model_task):
+                yield ka
             result = await model_task
             break
         except RuntimeError as e:
@@ -1241,77 +1263,39 @@ async def _stream_with_thinking(
                             "timeout" in err_str.lower() or "EOF" in err_str)
 
             if is_resource_exhausted:
-                # 配额耗尽策略：
-                #   1. 优先用 fallback 模型 (gemini-pro 等) 走 GetModelResponse（干净补全 API）
-                #   2. fallback 全失败 → 最后才走 Cascade（agent 框架，会吞用户请求）
-                fb_aliases = fallback_chain.get(normalized_model_id, [])
-                if fb_aliases:
-                    logger.info(f"[{req_id}] quota exhausted → trying fallback models: {fb_aliases}")
-                    yield ": keepalive trying fallback models\n\n"
-                    try:
-                        fb_task = asyncio.create_task(
-                            _parallel_fallback(req_id, messages, tools, fb_aliases)
-                        )
-                        while not fb_task.done():
-                            await asyncio.sleep(2)
-                            if not fb_task.done():
-                                yield ": keepalive\n\n"
-                        fb_result = await fb_task
-                        if fb_result:
-                            result = fb_result
-                            logger.info(f"[{req_id}] ✅ fallback model success")
-                            break
-                        else:
-                            logger.warning(f"[{req_id}] all fallback models failed")
-                    except Exception as fe:
-                        logger.warning(f"[{req_id}] fallback error: {fe}")
-
-                # fallback 失败 → 最后用 Cascade（用积分）
-                if result is None and internal_key in _CASCADE_MODEL_MAP:
-                    logger.info(f"[{req_id}] fallbacks exhausted → last resort: Cascade API (credits)...")
-                    yield ": keepalive switching to credits\n\n"
+                # --- Step 2: 免费配额用完 → 用 Cascade API (AI积分) 请求同一个模型 ---
+                if internal_key in _CASCADE_MODEL_MAP:
+                    logger.info(f"[{req_id}] 免费配额用完 → 用 AI 积分请求同一模型 {internal_key}")
+                    yield ": keepalive switching to AI credits\n\n"
                     try:
                         cascade_task = asyncio.create_task(
                             _call_cascade(internal_key, prompt, req_id=req_id, timeout=120)
                         )
-                        while not cascade_task.done():
-                            await asyncio.sleep(2)
-                            if not cascade_task.done():
-                                yield ": keepalive\n\n"
+                        async for ka in _wait_task_with_keepalive(cascade_task):
+                            yield ka
                         result = await cascade_task
-                        logger.info(f"[{req_id}] ✅ Cascade API success (used credits)")
+                        logger.info(f"[{req_id}] ✅ Cascade API 成功（消耗积分）")
                     except Exception as ce:
-                        logger.error(f"[{req_id}] Cascade also failed: {ce}")
-                        yield _chunk({"content": f"\n\nQuota exhausted and all fallbacks failed: {ce}"})
+                        logger.error(f"[{req_id}] Cascade 也失败了: {ce}")
+                        yield _chunk({"content": f"\n\n模型配额已用完，积分也无法使用: {ce}"})
                         yield _chunk({}, finish_reason="stop")
                         yield "data: [DONE]\n\n"
                         return
-                    break  # got result from Cascade
+                else:
+                    yield _chunk({"content": f"\n\n模型 {model_id} 配额已用完，且不支持积分付费。"})
+                    yield _chunk({}, finish_reason="stop")
+                    yield "data: [DONE]\n\n"
+                    return
+                break
 
-                if result is None:
-                    # 没有 fallback 也没有 Cascade，重试等待配额恢复
-                    wait = min(10 + attempt * 5, 30)
-                    logger.info(f"[{req_id}] quota limited, no fallback available, retry in {wait}s...")
-                    yield ": keepalive retry\n\n"
-                    await asyncio.sleep(wait)
-                    continue
-                break  # got result from fallback
-
-            if is_transient and attempt < max_retries - 1:
-                wait = min(2 + attempt, 8)
-                logger.info(f"[{req_id}] transient error, retry in {wait}s (attempt {attempt+1}/{max_retries})...")
+            if is_transient and attempt < 1:
+                wait = _backoff_with_jitter(attempt, base=1.0, cap=5.0)
+                logger.info(f"[{req_id}] transient error, retry in {wait:.1f}s")
                 yield ": keepalive retry\n\n"
                 await asyncio.sleep(wait)
                 continue
 
-            # Unknown error
-            if attempt < 3:
-                logger.warning(f"[{req_id}] unknown error: {e}, retry (attempt {attempt+1})...")
-                yield ": keepalive retry\n\n"
-                await asyncio.sleep(3)
-                continue
-
-            logger.error(f"[{req_id}] LS error after retries: {e}")
+            logger.error(f"[{req_id}] LS error: {e}")
             yield _chunk({"content": f"\n\nError: {e}\n\nPlease try again."})
             yield _chunk({}, finish_reason="stop")
             yield "data: [DONE]\n\n"

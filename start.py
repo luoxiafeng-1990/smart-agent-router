@@ -275,11 +275,19 @@ def main():
     print("=" * 55)
     self_cleanup()
 
+    # 方案2: 支持 --direct 参数跳过 Cloudflare Tunnel
+    direct_mode = "--direct" in sys.argv or os.environ.get("DIRECT_MODE", "").lower() in ("1", "true", "yes")
+
     setup_venv()
     if not start_router():
         sys.exit(1)
 
-    tunnel_url = start_tunnel()
+    tunnel_url = None
+    if not direct_mode:
+        tunnel_url = start_tunnel()
+    else:
+        log("⚡ 直连模式: 跳过 Cloudflare Tunnel (减少 ~200ms 延迟)")
+
     model_ok   = test_model()
 
     print()
@@ -287,14 +295,20 @@ def main():
     print("📋 Cursor / Claude Code 配置:")
     print()
     if tunnel_url:
-        print(f"   Base URL  :  {tunnel_url}/v1   ← 推荐（公网固定）")
-    print(f"   本地 URL  :  http://localhost:{PORT}/v1")
+        print(f"   公网 URL  :  {tunnel_url}/v1   ← 远程访问用")
+    print(f"   本地 URL  :  http://localhost:{PORT}/v1   ← 本机推荐（最低延迟）")
     print(f"   API Key   :  {API_KEY}")
     print()
+    if tunnel_url:
+        print(f"   ⚡ 提示: 本机使用 localhost 可节省 ~200ms/请求 (跳过 Cloudflare)")
+        print(f"   ⚡ 启动时加 --direct 可完全跳过隧道:  python3 start.py --direct")
+        print()
     print(f"   模型测试  :  {'✅ 通过' if model_ok else '❌ 失败（查看 server.log）'}")
     print()
+    print(f"   队列状态  :  curl http://localhost:{PORT}/api/queue-status")
     print(f"   日志      :  tail -f {PROJ}/server.log")
-    print(f"              tail -f {PROJ}/tunnel.log")
+    if not direct_mode:
+        print(f"              tail -f {PROJ}/tunnel.log")
     print("=" * 55)
 
 if __name__ == "__main__":
